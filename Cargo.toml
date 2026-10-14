@@ -1,0 +1,24 @@
+[package]
+name = "vfm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A small, fast, terminal file manager modeled after nnn"
+
+[dependencies]
+crossterm = "0.29"
+unicode-width = "0.2"
+toml = "1"
+regex-lite = "0.1"
+trash = { version = "5", optional = true }
+
+[features]
+default = ["trash"]
+trash = ["dep:trash"]
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
+opt-level = 3

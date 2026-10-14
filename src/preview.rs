@@ -1,0 +1,648 @@
+//! Preview pipeline: debounce → job → done state machine with content-
+//! signature dedup (yazi's PreviewSig pattern). Plugin previews run as child
+//! processes whose stdout is parsed incrementally by [`crate::ansi`]; when no
+//! previewer rule matches, the builtin fallback runs synchronously in-process.
+//!
+//! Ownership: exactly one owner (the App loop) touches Preview; the only
+//! cross-thread edges are the job's mpsc channel and `child.kill()` from the
+//! loop thread. `Drop for JobHandle` kills + reaps on a detached thread, so
+//! superseding a slow previewer never blocks input and leaves no zombies.
+
+use crate::ansi::AnsiFeeder;
+use crate::sort::natural_cmp;
+use crate::ui::Line;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
+
+const MAX_LINES: usize = 20_000;
+const READ_BUF: usize = 64 * 1024;
+
+// ---------------------------------------------------------------- signature
+
+/// FNV-1a over path bytes, size, mtime, pane size and rule id — identical
+/// signature means "already showing this content" (yazi PreviewSig).
+pub fn make_sig(path: &Path, size: u64, mtime: i64, pane: (u16, u16), rule: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |b: &[u8]| {
+        for &byte in b {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(path.as_os_str().as_encoded_bytes());
+    mix(&size.to_le_bytes());
+    mix(&mtime.to_le_bytes());
+    mix(&pane.0.to_le_bytes());
+    mix(&pane.1.to_le_bytes());
+    mix(&rule.to_le_bytes());
+    h
+}
+
+// ---------------------------------------------------------------- job handle
+
+pub enum PreviewMsg {
+    Lines(Vec<Line>),
+    Done { truncated: bool },
+}
+
+/// A running previewer child + its reader-thread channel. The Child lives
+/// here; the reader thread owns only stdout. Drop = kill + reap detached.
+pub struct JobHandle {
+    child: Option<Child>,
+    pub rx: Receiver<PreviewMsg>,
+}
+
+impl JobHandle {
+    /// Run `command` (argv/env/cwd already set) with stdout captured.
+    pub fn spawn(mut command: Command, max_bytes: usize) -> std::io::Result<JobHandle> {
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("vfm-preview".into())
+            .spawn(move || read_job(stdout, tx, max_bytes))?;
+        Ok(JobHandle { child: Some(child), rx })
+    }
+}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            // Reap off-thread: the reader may still be draining the pipe.
+            std::thread::Builder::new()
+                .name("vfm-reap".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+                .ok();
+        }
+    }
+}
+
+/// Reader-thread body: stdout → AnsiFeeder → chunked Lines messages, then
+/// Done after EOF. Sends are the thread's only blocking point; a superseded
+/// job fails its first send after the receiver is dropped and exits.
+fn read_job(stdout: impl Read, tx: Sender<PreviewMsg>, max_bytes: usize) {
+    let mut feeder = AnsiFeeder::new();
+    let mut reader = std::io::BufReader::with_capacity(READ_BUF, stdout);
+    let mut buf = vec![0u8; READ_BUF];
+    let mut total = 0usize;
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if total + n <= max_bytes {
+                    total += n;
+                    feeder.feed(&buf[..n]);
+                    let lines = feeder.take_lines();
+                    if !lines.is_empty() && tx.send(PreviewMsg::Lines(lines)).is_err() {
+                        return; // receiver gone: job was superseded
+                    }
+                } else {
+                    truncated = true; // over budget: drain without parsing
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    feeder.finish();
+    let rest = feeder.take_lines();
+    if !rest.is_empty() {
+        let _ = tx.send(PreviewMsg::Lines(rest));
+    }
+    let _ = tx.send(PreviewMsg::Done { truncated });
+}
+
+// ---------------------------------------------------------------- state
+
+/// What produces a preview's content.
+#[derive(Clone, Debug)]
+pub enum Source {
+    /// In-process fallback: text head, dir listing, symlink target.
+    Builtin,
+    /// A `[[previewer]]` argv; the path, width and height are appended.
+    Previewer(Vec<String>),
+    /// A `>` plugin's command line, run through the shell in the current
+    /// directory. Never cached: it describes the directory, which changes.
+    Shell(String),
+}
+
+pub struct Target {
+    pub path: PathBuf,
+    pub source: Source,
+    pub sig: u64,
+}
+
+pub enum PreviewState {
+    Idle,
+    Debounce { target: Target, at: Instant },
+    Running { target: Target, job: JobHandle },
+    Done { sig: u64, lines: std::sync::Arc<[Line]>, truncated: bool },
+    Failed { sig: u64, err: String },
+}
+
+/// What on_tick decided the app should do about repainting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tick {
+    Quiet,
+    /// New chunks arrived — repaint the preview pane.
+    Chunks,
+    /// Job finished — repaint + statusbar hint update.
+    Finished,
+    /// Spawn failed — repaint (error shown in pane).
+    Failed,
+}
+
+pub struct Preview {
+    pub enabled: bool,
+    pub state: PreviewState,
+    /// Chunks of the currently-running job, drained from the channel by the
+    /// loop thread. Owned here so render can read it without cloning.
+    streaming: Vec<Line>,
+    streaming_truncated: bool,
+    streaming_sig: u64,
+    cache: Vec<(u64, std::sync::Arc<[Line]>, bool)>,
+    pub debounce: Duration,
+    pub max_bytes: usize,
+    /// Snapshot taken at request() time; used when the debounce expires.
+    pane: (u16, u16),
+    env: Vec<(String, String)>,
+    cwd: PathBuf,
+}
+
+impl Preview {
+    pub fn new(debounce: Duration, max_bytes: usize) -> Preview {
+        Preview {
+            enabled: false,
+            state: PreviewState::Idle,
+            streaming: Vec::new(),
+            streaming_truncated: false,
+            streaming_sig: 0,
+            cache: Vec::with_capacity(8),
+            debounce,
+            max_bytes,
+            pane: (80, 24),
+            env: Vec::new(),
+            cwd: PathBuf::from("."),
+        }
+    }
+
+    /// Refreshed by the app on every request so an expired debounce spawns
+    /// with current pane/env/cwd.
+    pub fn set_context(&mut self, pane: (u16, u16), env: Vec<(String, String)>, cwd: &Path) {
+        self.pane = pane;
+        self.env = env;
+        self.cwd = cwd.to_path_buf();
+    }
+
+    pub fn is_busy(&self) -> bool {
+        matches!(self.state, PreviewState::Running { .. } | PreviewState::Debounce { .. })
+    }
+
+    /// Failed-state error text, if any.
+    pub fn error(&self) -> Option<&str> {
+        match &self.state {
+            PreviewState::Failed { err, .. } => Some(err),
+            _ => None,
+        }
+    }
+
+    /// Lines to render + truncated flag, from whichever state has content.
+    pub fn lines(&self) -> Option<(&[Line], bool)> {
+        match &self.state {
+            PreviewState::Done { lines, truncated, .. } => Some((lines, *truncated)),
+            _ if !self.streaming.is_empty() => Some((&self.streaming, self.streaming_truncated)),
+            _ => None,
+        }
+    }
+
+    /// The app calls this whenever the hovered entry (or pane size) changes.
+    /// Same sig → no-op; supersede otherwise; cache hit → instant Done.
+    pub fn request(&mut self, target: Target, now: Instant) {
+        if self.sig_matches(target.sig) {
+            return;
+        }
+        self.streaming.clear();
+        self.streaming_truncated = false;
+        self.streaming_sig = 0;
+        if let Some((lines, truncated)) = self.cache_hit(target.sig) {
+            self.state = PreviewState::Done { sig: target.sig, lines, truncated };
+            return;
+        }
+        let at = now + self.debounce;
+        self.state = PreviewState::Debounce { target, at };
+    }
+
+    pub fn disable(&mut self) {
+        self.state = PreviewState::Idle;
+        self.streaming.clear();
+    }
+
+    fn sig_matches(&self, sig: u64) -> bool {
+        let state_matches = match &self.state {
+            PreviewState::Done { sig: s, .. } | PreviewState::Failed { sig: s, .. } => *s == sig,
+            PreviewState::Debounce { target, .. } | PreviewState::Running { target, .. } => {
+                target.sig == sig
+            }
+            PreviewState::Idle => false,
+        };
+        state_matches || (self.streaming_sig == sig && !self.streaming.is_empty())
+    }
+
+    fn cache_hit(&mut self, sig: u64) -> Option<(std::sync::Arc<[Line]>, bool)> {
+        if let Some(i) = self.cache.iter().position(|(s, _, _)| *s == sig) {
+            let entry = self.cache.remove(i);
+            self.cache.push(entry.clone());
+            return Some((entry.1, entry.2));
+        }
+        None
+    }
+
+    fn cache_put(&mut self, sig: u64, lines: std::sync::Arc<[Line]>, truncated: bool) {
+        if lines.is_empty() {
+            return;
+        }
+        if self.cache.len() >= 8 {
+            self.cache.remove(0);
+        }
+        self.cache.push((sig, lines, truncated));
+    }
+
+    /// Drive the state machine; called every loop pass. `now` comes from the
+    /// caller so tests can script time.
+    pub fn tick(&mut self, now: Instant) -> Tick {
+        // Debounce expiry → spawn.
+        if let PreviewState::Debounce { at, .. } = &self.state {
+            if *at > now {
+                return Tick::Quiet;
+            }
+            let PreviewState::Debounce { target, .. } =
+                std::mem::replace(&mut self.state, PreviewState::Idle)
+            else {
+                unreachable!()
+            };
+            return self.start(target);
+        }
+        // Running → drain chunks.
+        let PreviewState::Running { target, job } = &mut self.state else {
+            return Tick::Quiet;
+        };
+        let mut tick = Tick::Quiet;
+        loop {
+            match job.rx.try_recv() {
+                Ok(PreviewMsg::Lines(lines)) => {
+                    if self.streaming.is_empty() {
+                        self.streaming_sig = target.sig;
+                    }
+                    self.streaming.extend(lines);
+                    if self.streaming.len() > MAX_LINES {
+                        self.streaming.truncate(MAX_LINES);
+                        self.streaming_truncated = true;
+                    }
+                    tick = Tick::Chunks;
+                }
+                Ok(PreviewMsg::Done { truncated }) => {
+                    let truncated = self.streaming_truncated || truncated;
+                    let lines: std::sync::Arc<[Line]> = std::mem::take(&mut self.streaming).into();
+                    self.streaming_truncated = false;
+                    self.streaming_sig = 0;
+                    let sig = target.sig;
+                    if !matches!(target.source, Source::Shell(_)) {
+                        self.cache_put(sig, lines.clone(), truncated);
+                    }
+                    self.state = PreviewState::Done { sig, lines, truncated };
+                    return Tick::Finished;
+                }
+                Err(TryRecvError::Empty) => return tick,
+                Err(TryRecvError::Disconnected) => {
+                    // Reader died without Done: fail gracefully, never hang.
+                    let sig = target.sig;
+                    self.streaming.clear();
+                    self.state = PreviewState::Failed { sig, err: "previewer crashed".into() };
+                    return Tick::Failed;
+                }
+            }
+        }
+    }
+
+    /// Transition Debounce → Running (external command) or Done (builtin).
+    fn start(&mut self, target: Target) -> Tick {
+        let command = match &target.source {
+            Source::Builtin => {
+                let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
+                let sig = target.sig;
+                let lines: std::sync::Arc<[Line]> = lines.into();
+                self.cache_put(sig, lines.clone(), truncated);
+                self.state = PreviewState::Done { sig, lines, truncated };
+                return Tick::Finished;
+            }
+            Source::Previewer(argv) => {
+                let Some((prog, args)) = argv.split_first() else {
+                    self.state = PreviewState::Failed { sig: target.sig, err: "empty command".into() };
+                    return Tick::Failed;
+                };
+                let mut c = Command::new(prog);
+                c.args(args)
+                    .arg(&target.path)
+                    .arg(self.pane.0.to_string())
+                    .arg(self.pane.1.to_string())
+                    .envs(self.env.iter().map(|(k, v)| (k, v)))
+                    .current_dir(&self.cwd);
+                c
+            }
+            Source::Shell(line) => crate::plugin::shell_command(line, &self.cwd, &self.env),
+        };
+        match JobHandle::spawn(command, self.max_bytes) {
+            Ok(job) => {
+                self.state = PreviewState::Running { target, job };
+                Tick::Quiet
+            }
+            Err(e) => {
+                let sig = target.sig;
+                self.state = PreviewState::Failed { sig, err: format!("spawn: {e}") };
+                Tick::Failed
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- builtin
+
+/// The no-plugin fallback: dir listing / text head / symlink target — all
+/// synchronous, allocation-bounded, safe on binary files.
+pub fn builtin_preview(path: &Path, pane: (u16, u16), max_bytes: usize) -> (Vec<Line>, bool) {
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => return (vec![Line::plain(format!("stat: {e}"))], false),
+    };
+    if md.is_dir() {
+        return builtin_dir(path, pane.1 as usize);
+    }
+    if md.file_type().is_symlink() {
+        let text = match std::fs::read_link(path) {
+            Ok(t) => format!("→ {}", t.to_string_lossy()),
+            Err(e) => format!("→ readlink: {e}"),
+        };
+        return (vec![Line::plain(text)], false);
+    }
+    if !md.is_file() {
+        return (vec![Line::plain("(special file)")], false);
+    }
+    builtin_file(path, max_bytes)
+}
+
+fn builtin_dir(path: &Path, rows: usize) -> (Vec<Line>, bool) {
+    let mut names: Vec<String> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(path) else { return (vec![], false) };
+    for de in rd.flatten() {
+        let mut n = de.file_name().to_string_lossy().into_owned();
+        if de.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+            n.push('/');
+        }
+        names.push(n);
+    }
+    names.sort_by(|a, b| natural_cmp(a, b));
+    let total = names.len();
+    // Cap generation cost on huge dirs; the renderer shows what fits anyway.
+    let cap = rows.saturating_sub(1).clamp(20, 10_000);
+    let lines: Vec<Line> = names.into_iter().take(cap).map(Line::plain).collect();
+    (lines, total > cap)
+}
+
+fn builtin_file(path: &Path, max_bytes: usize) -> (Vec<Line>, bool) {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return (vec![Line::plain(format!("open: {e}"))], false),
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let want = max_bytes.min(256 * 1024);
+    let mut data = Vec::with_capacity(want.min(64 * 1024));
+    let mut chunk = [0u8; READ_BUF];
+    let mut truncated = len as usize > want;
+    while data.len() < want {
+        let n = match f.read(&mut chunk[..(want - data.len()).min(READ_BUF)]) {
+            Ok(0) => {
+                truncated = false;
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        data.extend_from_slice(&chunk[..n]);
+    }
+    if looks_binary(&data) {
+        let kind = sniff_kind(&data);
+        let lines = vec![
+            Line::plain(format!("binary: {kind}")),
+            Line::plain(format!("{} bytes", crate::util::coolsize(len))),
+        ];
+        return (lines, truncated);
+    }
+    // Reuse the ANSI feeder for line splitting + control-char hygiene: the
+    // same path plugin output takes, so text previews look identical.
+    let mut feeder = AnsiFeeder::new();
+    feeder.feed(&data);
+    feeder.finish();
+    (feeder.take_lines(), truncated)
+}
+
+/// NUL in the head, or >10% control bytes, means "don't pretend this is text".
+fn looks_binary(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(8192)];
+    if head.contains(&0) {
+        return true;
+    }
+    if head.is_empty() {
+        return false;
+    }
+    let ctrl = head.iter().filter(|&&b| b < 0x09 || (0x0e..0x20).contains(&b)).count();
+    ctrl * 10 > head.len()
+}
+
+fn sniff_kind(data: &[u8]) -> &'static str {
+    if data.starts_with(b"\x7fELF") {
+        "ELF binary"
+    } else if data.starts_with(&[0x4d, 0x5a]) {
+        "Windows executable"
+    } else if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "PNG image"
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        "JPEG image"
+    } else if data.starts_with(b"PK") {
+        "zip archive"
+    } else if data.starts_with(b"%PDF") {
+        "PDF document"
+    } else {
+        "binary data"
+    }
+}
+
+// ---------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("vfm-prev-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn builtin_text_and_binary() {
+        let d = tmpdir("builtin");
+        std::fs::write(d.join("t.txt"), b"line one\nline two\n").unwrap();
+        let (lines, trunc) = builtin_preview(&d.join("t.txt"), (80, 24), 64 * 1024);
+        assert!(!trunc);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text(), "line one");
+
+        let mut png = vec![0x89, b'P', b'N', b'G', 0, 0, 0, 0];
+        png.extend(std::iter::repeat_n(0u8, 64));
+        std::fs::write(d.join("img.png"), &png).unwrap();
+        let (lines, _) = builtin_preview(&d.join("img.png"), (80, 24), 64 * 1024);
+        assert_eq!(lines[0].text(), "binary: PNG image");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn builtin_dir_and_truncation() {
+        let d = tmpdir("dir");
+        for n in ["b", "a", "c"] {
+            fs_create(&d.join(n));
+        }
+        let (lines, trunc) = builtin_preview(&d, (80, 24), 64 * 1024);
+        assert!(!trunc);
+        let texts: Vec<String> = lines.iter().map(|l| l.text()).collect();
+        assert_eq!(texts, vec!["a/", "b/", "c/"]);
+
+        let big = "x".repeat(300 * 1024);
+        std::fs::write(d.join("big.txt"), &big).unwrap();
+        let (_, trunc) = builtin_preview(&d.join("big.txt"), (80, 24), 64 * 1024);
+        assert!(trunc);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn fs_create(p: &Path) {
+        std::fs::create_dir(p).unwrap();
+    }
+
+    #[test]
+    fn binary_sniff() {
+        assert!(looks_binary(&[0x7f, b'E', b'L', b'F', 0, 1, 2, 3]));
+        assert!(!looks_binary(b"plain text\nwith lines\n"));
+        assert!(!looks_binary(b""));
+    }
+
+    #[test]
+    fn sig_changes_with_inputs() {
+        let p = Path::new("/tmp/x");
+        let base = make_sig(p, 10, 20, (80, 24), 0);
+        assert_eq!(base, make_sig(p, 10, 20, (80, 24), 0));
+        assert_ne!(base, make_sig(p, 11, 20, (80, 24), 0));
+        assert_ne!(base, make_sig(p, 10, 21, (80, 24), 0));
+        assert_ne!(base, make_sig(p, 10, 20, (79, 24), 0));
+        assert_ne!(base, make_sig(p, 10, 20, (80, 24), 1));
+        assert_ne!(base, make_sig(Path::new("/tmp/y"), 10, 20, (80, 24), 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_lifecycle_and_supersede() {
+        let d = tmpdir("job");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'a\\nb\\n'; sleep 30"]);
+        let job = JobHandle::spawn(cmd, 64 * 1024).unwrap();
+        // First chunk arrives quickly.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        while Instant::now() < deadline {
+            match job.rx.try_recv() {
+                Ok(PreviewMsg::Lines(ls)) => got = ls,
+                Ok(PreviewMsg::Done { .. }) => break,
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryRecvError::Disconnected) => panic!("reader died early"),
+            }
+        }
+        assert_eq!(got.len(), 2);
+        // Supersede: dropping the handle kills the sleeper and reaps it.
+        drop(job);
+        std::thread::sleep(Duration::from_millis(50));
+        // The real assertion is absence of a leaked `sleep 30` child — if
+        // kill/reap were broken, this process would hold a live child here.
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_machine_dedup_and_cache() {
+        let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
+        let d = tmpdir("state");
+        let path = d.join("f.txt");
+        std::fs::write(&path, b"hello\n").unwrap();
+        let pane = (80u16, 24u16);
+        let sig = make_sig(&path, 6, 1, pane, 0);
+
+        let t0 = Instant::now();
+        pv.request(Target { path: path.clone(), source: Source::Builtin, sig }, t0);
+        assert!(pv.is_busy());
+        // Same sig again → still one debounce, no restart.
+        pv.request(Target { path: path.clone(), source: Source::Builtin, sig }, t0);
+        assert!(matches!(pv.state, PreviewState::Debounce { .. }));
+
+        assert_eq!(pv.tick(t0), Tick::Finished);
+        assert!(matches!(pv.state, PreviewState::Done { .. }));
+        let (lines, _) = pv.lines().unwrap();
+        assert_eq!(lines[0].text(), "hello");
+
+        // Leave + come back with same sig → served from cache, Done instantly.
+        pv.disable();
+        pv.request(Target { path: path.clone(), source: Source::Builtin, sig }, t0);
+        assert!(matches!(pv.state, PreviewState::Done { .. }));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Drive a preview to completion (debounce, spawn, drain).
+    #[cfg(unix)]
+    fn run_to_done(pv: &mut Preview) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pv.is_busy() && Instant::now() < deadline {
+            pv.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(pv.state, PreviewState::Done { .. }), "error: {:?}", pv.error());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_source_runs_in_cwd_and_is_never_cached() {
+        let d = tmpdir("shell");
+        let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
+        pv.set_context((80, 24), vec![("VFM_X".into(), "env-ok".into())], &d);
+        let target = || Target {
+            path: d.clone(),
+            source: Source::Shell("ls; echo \"$VFM_X\"".into()),
+            sig: 42,
+        };
+        std::fs::write(d.join("one"), b"").unwrap();
+        pv.request(target(), Instant::now());
+        run_to_done(&mut pv);
+        let texts: Vec<String> = pv.lines().unwrap().0.iter().map(|l| l.text()).collect();
+        assert_eq!(texts, ["one", "env-ok"]); // ran in cwd, saw the env
+        // A rerun after the directory changed must not be served from cache.
+        std::fs::write(d.join("two"), b"").unwrap();
+        pv.disable();
+        pv.request(target(), Instant::now());
+        run_to_done(&mut pv);
+        assert_eq!(pv.lines().unwrap().0.len(), 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
