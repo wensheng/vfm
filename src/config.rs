@@ -55,6 +55,8 @@ pub struct PreviewCfg {
     pub max_bytes: usize,
     /// The built-in kitim plugin: image and video previews, off by default.
     pub kitim: bool,
+    /// Videos previewed by the kitim plugin play their sound.
+    pub kitim_sound: bool,
     /// Highlight text previews with bat when it is installed.
     pub bat: bool,
 }
@@ -76,13 +78,15 @@ const KITIM_TYPES: &[&str] = &[
 ];
 
 /// The rule `[preview] kitim = true` adds: kitim's embedded preview mode,
-/// which takes the path, width and height vfm appends.
-pub fn kitim_rule() -> PreviewerRule {
+/// which takes the path, width and height vfm appends. With `sound`, videos
+/// play their audio.
+pub fn kitim_rule(sound: bool) -> PreviewerRule {
     let patterns = KITIM_TYPES
         .iter()
         .flat_map(|ext| [format!("*.{ext}"), format!("*.{}", ext.to_uppercase())])
         .collect();
-    PreviewerRule { patterns, cmd: "kitim --preview".into(), graphics: true }
+    let cmd = if sound { "kitim --sound --preview" } else { "kitim --preview" };
+    PreviewerRule { patterns, cmd: cmd.into(), graphics: true }
 }
 
 #[derive(Clone, Debug)]
@@ -124,7 +128,14 @@ impl Default for Config {
             },
             sort: SortCfg { key: SortKey::Name, reverse: false, dirs_first: true },
             filter: FilterCfg { mode: FilterMode::Substring, smartcase: true },
-            preview: PreviewCfg { enabled: true, debounce_ms: 40, max_bytes: 256 * 1024, kitim: false, bat: true },
+            preview: PreviewCfg {
+                enabled: true,
+                debounce_ms: 40,
+                max_bytes: 256 * 1024,
+                kitim: false,
+                kitim_sound: false,
+                bat: true,
+            },
             theme: Theme::default(),
             previewers: Vec::new(),
             plugins: default_plugins(),
@@ -223,6 +234,7 @@ impl Config {
                 self.preview.max_bytes = (v.max(1024) as usize).min(16 * 1024 * 1024);
             }
             get_bool(p, "kitim", &mut self.preview.kitim);
+            get_bool(p, "kitim_sound", &mut self.preview.kitim_sound);
             get_bool(p, "bat", &mut self.preview.bat);
         }
         // [[previewer]] rules
@@ -250,7 +262,7 @@ impl Config {
         }
         // After the user's rules: first match wins, so theirs take precedence.
         if self.preview.kitim {
-            self.previewers.push(kitim_rule());
+            self.previewers.push(kitim_rule(self.preview.kitim_sound));
         }
         // [[plugin]] definitions
         if let Some(rules) = t.get("plugin").and_then(|v| v.as_array()) {
@@ -485,9 +497,23 @@ graphics = true
         assert!(cfg.previewers[0].graphics);
         let kitim = &cfg.previewers[1];
         assert_eq!((kitim.cmd.as_str(), kitim.graphics), ("kitim --preview", true));
+        assert!(!cfg.preview.kitim_sound);
         for name in ["*.jpg", "*.JPG", "*.mp4", "*.MOV", "*.gif"] {
             assert!(kitim.patterns.iter().any(|p| p == name), "{name}");
         }
+    }
+
+    #[test]
+    fn kitim_sound_adds_the_sound_flag() {
+        let mut cfg = Config::default();
+        let t: toml::Table = "[preview]\nkitim = true\nkitim_sound = true\n".parse().unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert_eq!(cfg.previewers.last().unwrap().cmd, "kitim --sound --preview");
+        // Without the plugin enabled, the sound switch adds nothing.
+        let mut cfg = Config::default();
+        let t: toml::Table = "[preview]\nkitim_sound = true\n".parse().unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert!(cfg.previewers.is_empty());
     }
 
     #[test]

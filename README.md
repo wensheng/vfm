@@ -88,6 +88,7 @@ enabled     = true
 debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
 kitim       = false       # image/video previews via kitim (see "Built-in plugin: kitim")
+kitim_sound = false       # and play videos' sound in those previews
 bat         = true        # highlight text previews with bat (or batcat), if installed
 
 [colors]                  # name, 0-255, or 0xRRGGBB
@@ -157,19 +158,22 @@ kitim = true
 
 That previews images (png, jpg, gif, webp, bmp, ico, tiff, tga, qoi, pnm) and
 videos (mp4, m4v, mkv, webm, mov, avi, wmv, flv, mpg, mpeg, 3gp), in lower or
-upper case. Animated GIFs and videos play muted and loop until you move the
-cursor. The switch adds this rule after your own `[[previewer]]` rules, so
-yours win for the files they match:
+upper case. Animated GIFs and videos loop until you move the cursor. Videos
+are muted unless you also set `kitim_sound = true`; then their sound plays,
+and stops when you move off the file or vfm runs another program.
+
+That's all the configuration needed. Behind the switch, vfm adds a rule like
+the one below, after your own `[[previewer]]` rules. Don't copy it into your
+config: a rule of yours wins for the files it matches, so it would replace
+the built-in one there, `kitim_sound` included. Write one only to change
+something, such as a kitim that isn't on `PATH` or other file types:
 
 ```toml
 [[previewer]]
 match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
-run      = "kitim --preview"
+run      = "kitim --preview"         # "kitim --sound --preview" with kitim_sound
 graphics = true
 ```
-
-To run a kitim that isn't on `PATH`, or for other file types, write that rule
-yourself with the path in `run`.
 
 ### Plugin modes
 

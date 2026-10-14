@@ -1084,6 +1084,8 @@ impl App {
         env.extend(extra_env);
         // Re-entering the alternate screen wipes images; render() re-sends.
         self.hide_graphics();
+        // Stop the previewer meanwhile: a video would keep playing its sound.
+        self.preview.disable();
         self.screen.flush();
         self.screen.leave();
         let res = plugin::run_fullscreen(cmdline, &dir, &env);
@@ -1092,6 +1094,8 @@ impl App {
         // The child may have changed the directory contents.
         if self.dir.changed() {
             self.reload_dir();
+        } else {
+            self.preview_on_hover();
         }
         match res {
             Ok(()) => {}
@@ -2830,6 +2834,26 @@ mod tests {
         assert!(out.take().contains("\x1b_Ga=T,i=5827"));
         assert_eq!(app.run(), Flow::Quit(0)); // TestSource sends C-q
         assert!(out.take().ends_with("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stepping_aside_stops_the_previewer_and_restarts_it_after() {
+        let (mut app, d, _) = graphics_app("gfxsuspend");
+        // Keeps running after its frame, as a playing video does.
+        app.cfg.previewers[0].cmd = r#"sh -c "printf '\033_Ga=T,i=1;AAAA\033\\\\'; sleep 30""#.into();
+        app.preview_on_hover();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.preview.image().is_none() && Instant::now() < deadline {
+            app.preview.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(app.preview.state, crate::preview::PreviewState::Running { .. }));
+        app.suspend_and_run("true", vec![]);
+        // The running job was dropped (killed); a fresh one is on its way.
+        assert!(matches!(app.preview.state, crate::preview::PreviewState::Debounce { .. }));
+        assert!(app.preview.image().is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
