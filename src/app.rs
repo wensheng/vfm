@@ -514,13 +514,7 @@ impl App {
                     self.set_cursor(i);
                 }
             }
-            Action::Back => {
-                if !self.cd_parent() {
-                    // Already at the filesystem root: close the context
-                    // (nnn's behavior at /).
-                    return Some(self.quit_ctx());
-                }
-            }
+            Action::Back => self.cd_parent(),
             Action::NavIn => self.nav_in(),
             Action::Open => {
                 if let Some(flow) = self.open_hovered() {
@@ -971,18 +965,16 @@ impl App {
         self.dirty = Dirty::Full;
     }
 
-    /// Go to the parent directory (with cursor restore). Returns false when
-    /// already at the root — the caller turns that into QuitCtx.
-    fn cd_parent(&mut self) -> bool {
+    /// Go to the parent directory (with cursor restore). Do nothing at the root.
+    fn cd_parent(&mut self) {
         let parent = self.dir.path.parent().map(Path::to_path_buf);
         match parent {
             Some(p) if p != self.dir.path => {
                 let name = file_name_of(&self.dir.path.clone());
                 self.cd(&p);
                 self.dir.move_to_name(&name);
-                true
             }
-            _ => false,
+            _ => {}
         }
     }
 
@@ -2288,6 +2280,28 @@ mod tests {
         act(&mut app, Action::Back);
         assert_eq!(app.dir.path, d);
         assert_eq!(app.dir.hovered_name(), Some("subdir")); // cursor restored
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn left_at_root_keeps_current_context_open() {
+        let (mut app, d) = test_app("root-back");
+        act(&mut app, Action::CdRoot);
+        for context in [0, 1] {
+            act(&mut app, Action::GotoCtx(context));
+            let context = usize::from(context);
+            let active = app.ctx_active;
+            let cursor = app.dir.cursor;
+            let last_dir = app.ctx[context].last_dir.clone();
+            for _ in 0..3 {
+                assert_eq!(app.handle_event(special(KeyCode::Left)), None);
+                assert_eq!(app.dir.path, Path::new("/"));
+                assert_eq!(app.dir.cursor, cursor);
+                assert_eq!((app.ctx_i, app.ctx_active), (context, active));
+                assert_eq!(app.ctx[context].last_dir, last_dir);
+                assert_eq!(app.dirty, Dirty::None);
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
