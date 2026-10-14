@@ -2674,23 +2674,58 @@ mod tests {
     /// The shipped plugin against the real `tree`, when it's installed.
     #[cfg(unix)]
     #[test]
-    fn builtin_tree_plugin_end_to_end() {
+    fn builtin_tree_plugin_shows_highlighted_folder_in_pane_and_pager() {
         if !crate::plugin::which("tree") {
             eprintln!("skipping: tree not installed");
             return;
         }
         let (mut app, d) = test_app("treereal");
-        std::fs::write(d.join("subdir/inner.txt"), b"").unwrap();
+        let folder = d.join("selected '$ folder");
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        std::fs::write(folder.join("nested/inner.txt"), b"").unwrap();
+        std::fs::write(folder.join("inside.txt"), b"").unwrap();
+        app.reload_dir();
+        app.dir.move_to_name("selected '$ folder");
+        let folder = app.dir.hovered_path().unwrap();
         app.preview.debounce = Duration::ZERO;
-        let key = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        app.handle_event(key);
+        for width in [120, 80] {
+            app.screen = Screen::new(Box::new(io::sink()), width, 30);
+            app.handle_event(key('s'));
+            drive_preview(&mut app);
+            let texts = if width >= 100 {
+                assert!(app.preview_pin.is_some());
+                preview_texts(&app)
+            } else {
+                let Mode::Pager { lines, .. } = &app.mode else { panic!("expected pager") };
+                lines.iter().map(|line| line.text()).collect()
+            };
+            assert_eq!(texts[0], folder.to_string_lossy(), "{texts:?}");
+            // --dirsfirst: the nested directory comes before inside.txt.
+            assert!(texts[1].ends_with("nested") && texts[2].ends_with("inner.txt"), "{texts:?}");
+            assert!(texts.last().unwrap().ends_with("2 files"), "{texts:?}");
+            assert!(!texts.iter().any(|line| line.ends_with("alpha")), "{texts:?}");
+            app.handle_event(special(KeyCode::Esc));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_tree_plugin_uses_current_directory_when_empty() {
+        if !crate::plugin::which("tree") {
+            eprintln!("skipping: tree not installed");
+            return;
+        }
+        let (mut app, d) = test_app("treeempty");
+        std::fs::create_dir_all(d.join("empty")).unwrap();
+        app.cd(&d.join("empty"));
+        assert!(app.dir.hovered_path().is_none());
+        app.preview.debounce = Duration::ZERO;
+        app.handle_event(key('s'));
         drive_preview(&mut app);
         let texts = preview_texts(&app);
-        assert_eq!(texts[0], ".", "{texts:?}");
-        // --dirsfirst: subdir (with its child) comes before the files.
-        assert!(texts[1].ends_with("subdir") && texts[2].ends_with("inner.txt"), "{texts:?}");
-        // Summary line (tree versions differ on whether `.` counts as a dir).
-        assert!(texts.last().unwrap().ends_with("4 files"), "{texts:?}");
+        assert_eq!(texts[0], app.dir.path.to_string_lossy(), "{texts:?}");
+        assert!(texts.last().unwrap().ends_with("0 files"), "{texts:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

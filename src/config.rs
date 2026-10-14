@@ -74,7 +74,11 @@ pub struct PluginDef {
 /// (e.g. to change its key, or `key = ""` to unbind it).
 fn default_plugins() -> Vec<PluginDef> {
     // Windows ships its own tree.com with different flags (no colors).
-    let cmd = if cfg!(windows) { "> tree /F /A" } else { "> tree -C --dirsfirst -L 3" };
+    let cmd = if cfg!(windows) {
+        r#"> if defined VFM_PATH (tree "%VFM_PATH%" /F /A) else (tree /F /A)"#
+    } else {
+        r#"> tree -C --dirsfirst -L 3 "${VFM_PATH:-$VFM_DIR}""#
+    };
     vec![PluginDef {
         name: "tree".into(),
         cmd: cmd.into(),

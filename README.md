@@ -39,7 +39,7 @@ Press `?` inside vfm for the full key list. The essentials:
 | `x` / `X` | trash / delete (confirm with `y`) |
 | `n`, `C-r` | new file (trailing `/` = dir), rename |
 | `P` | toggle preview pane (terminal ≥ 100 columns) |
-| `s` | tree view of the current dir in the preview pane (needs `tree`) |
+| `s` | tree view of the highlighted folder in the preview pane (needs `tree`) |
 | `;` | plugin menu |
 | `q`, `C-q`, `C-g` | close context, quit, quit and cd |
 
@@ -138,7 +138,7 @@ vfm ships one plugin, equivalent to:
 ```toml
 [[plugin]]
 name     = "tree"
-cmd      = "> tree -C --dirsfirst -L 3"   # Windows: "> tree /F /A"
+cmd      = '> tree -C --dirsfirst -L 3 "${VFM_PATH:-$VFM_DIR}"'
 key      = "s"
 requires = "tree"
 ```
@@ -146,6 +146,10 @@ requires = "tree"
 A `[[plugin]]` with `name = "tree"` replaces it, for example to change the depth or
 the key (`key = ""` unbinds it). A key you assign in `[keys]` always takes
 precedence over a plugin's key.
+
+The tree starts at the highlighted folder. If the listing is empty, it uses the
+current directory. On Windows, the built-in command is
+`> if defined VFM_PATH (tree "%VFM_PATH%" /F /A) else (tree /F /A)`.
 
 ### Environment and control lines
 
