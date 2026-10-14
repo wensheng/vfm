@@ -13,6 +13,9 @@ toml = "1"
 regex-lite = "0.1"
 trash = { version = "5", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["trash"]
 trash = ["dep:trash"]

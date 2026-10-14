@@ -605,6 +605,7 @@ name = "vfm"
 version = "0.1.1"
 dependencies = [
  "crossterm",
+ "libc",
  "regex-lite",
  "toml",
  "trash",

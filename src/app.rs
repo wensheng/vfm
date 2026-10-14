@@ -13,6 +13,7 @@ use crate::ops::{self, OpHandle, OpKind, OpRequest};
 use crate::plugin::{self, Reply, SpawnMode};
 use crate::preview::{make_sig, Preview, Source, Target, Tick as PreviewTick};
 use crate::selection::Selection;
+use crate::term;
 use crate::ui::{Attrs, Line, Screen, Span, Style, Theme};
 use crate::util::{coolsize, fmt_time, now_secs, tilde_path, truncate_cols};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -232,6 +233,10 @@ pub struct App {
     pub preview_pin: Option<Pin>,
     pub start_dir: PathBuf,
     pub home: Option<PathBuf>,
+    /// Host terminal category; `Other` until the probe (if any) reports.
+    pub term: term::Kind,
+    /// Terminal probe in flight: its thread owns tty input until it reports.
+    pub probe: Option<term::Probe>,
     keymap: std::collections::HashMap<KeyEvent, Action>,
     last_cursor: usize,
     last_scroll: usize,
@@ -296,6 +301,8 @@ impl App {
             preview_pin: None,
             start_dir,
             home,
+            term: term::Kind::Other,
+            probe: None,
             keymap,
             last_cursor: 0,
             last_scroll: 0,
@@ -313,7 +320,21 @@ impl App {
         loop {
             self.render();
             let timeout = self.poll_timeout();
-            match self.events.poll(timeout) {
+            // Until the terminal probe reports, its thread owns tty input:
+            // crossterm would misparse the probe's replies as keystrokes.
+            let polled = match &self.probe {
+                Some(probe) => match probe.wait(timeout) {
+                    Some(report) => {
+                        if let Some(flow) = self.settle_term(report) {
+                            return flow;
+                        }
+                        continue;
+                    }
+                    None => Ok(false),
+                },
+                None => self.events.poll(timeout),
+            };
+            match polled {
                 Ok(true) => match self.events.read() {
                     Ok(ev) => {
                         if let Some(flow) = self.handle_event(ev) {
@@ -330,6 +351,13 @@ impl App {
                 Err(e) => self.notify(format!("poll: {e}")),
             }
         }
+    }
+
+    /// Records the terminal probe's verdict and replays the keys it swallowed.
+    fn settle_term(&mut self, report: term::Report) -> Option<Flow> {
+        self.probe = None;
+        self.term = report.kind;
+        report.typeahead.into_iter().find_map(|k| self.handle_event(Event::Key(k)))
     }
 
     /// Adaptive poll interval — the port of nnn's timeout matrix.
@@ -2254,6 +2282,38 @@ mod tests {
         assert_eq!(app.dir.nvisible(), 1);
         assert!(d.join("keep.txt").exists(), "trash ran without confirmation");
         assert!(matches!(app.mode, Mode::Normal));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The probe owns tty input: the run loop reads no events until its
+    /// report lands, then replays the swallowed keys before live input.
+    #[test]
+    fn terminal_probe_gates_input_and_replays_typeahead() {
+        let d = tmpdir("probe");
+        for n in ["alpha", "beta", "gamma"] {
+            std::fs::write(d.join(n), b"").unwrap();
+        }
+        let src = TestSource::new();
+        // Replayed G (bottom: gamma) then live k (up: beta). Live k first
+        // would wrap alpha → gamma and G would stay there.
+        src.push(key('k'));
+        let screen = Screen::new(Box::new(io::sink()), 100, 30);
+        let mut app = App::new(Config::default(), d.clone(), screen, Box::new(src)).unwrap();
+        app.sel.file = d.join(".sel");
+        let (tx, probe) = term::Probe::channel();
+        app.probe = Some(probe);
+        // Report late, so a loop ignoring the gate reads k and the trailing
+        // C-q before the report exists.
+        let reporter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let typeahead = vec![KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)];
+            tx.send(term::Report { kind: term::Kind::KittyGraphics, typeahead }).unwrap();
+        });
+        assert_eq!(app.run(), Flow::Quit(0)); // trailing C-q
+        reporter.join().unwrap();
+        assert_eq!(app.term, term::Kind::KittyGraphics);
+        assert!(app.probe.is_none());
+        assert_eq!(app.dir.hovered_name(), Some("beta"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

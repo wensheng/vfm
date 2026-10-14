@@ -16,6 +16,7 @@ mod plugin;
 mod preview;
 mod selection;
 mod sort;
+mod term;
 mod ui;
 mod util;
 
@@ -128,6 +129,9 @@ fn main() -> ExitCode {
     if let Some(err) = cfg_err {
         app.notify(err);
     }
+    // Probe once startup can no longer fail (late replies would land in the
+    // shell) and before run() paints the first frame over any query echo.
+    (app.term, app.probe) = term::detect();
 
     let flow = app.run();
 
