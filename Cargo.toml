@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A small, fast, terminal file manager modeled after nnn"
+license = "Apache-2.0"
 
 [dependencies]
 crossterm = "0.29"
