@@ -53,12 +53,34 @@ pub struct PreviewCfg {
     pub enabled: bool,
     pub debounce_ms: u64,
     pub max_bytes: usize,
+    /// The built-in kitim plugin: image and video previews, off by default.
+    pub kitim: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct PreviewerRule {
     pub patterns: Vec<String>,
     pub cmd: String,
+    /// Prints kitty graphics frames, not text (see `graphics`). Only tried
+    /// when the terminal answered the graphics probe.
+    pub graphics: bool,
+}
+
+/// File types kitim previews: what the image crate decodes, plus video
+/// containers FFmpeg plays. Globs are case-sensitive, hence both cases.
+const KITIM_TYPES: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "tga", "qoi", "pnm", "ppm", "pgm", "pbm",
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "mpg", "mpeg", "3gp",
+];
+
+/// The rule `[preview] kitim = true` adds: kitim's embedded preview mode,
+/// which takes the path, width and height vfm appends.
+pub fn kitim_rule() -> PreviewerRule {
+    let patterns = KITIM_TYPES
+        .iter()
+        .flat_map(|ext| [format!("*.{ext}"), format!("*.{}", ext.to_uppercase())])
+        .collect();
+    PreviewerRule { patterns, cmd: "kitim --preview".into(), graphics: true }
 }
 
 #[derive(Clone, Debug)]
@@ -100,7 +122,7 @@ impl Default for Config {
             },
             sort: SortCfg { key: SortKey::Name, reverse: false, dirs_first: true },
             filter: FilterCfg { mode: FilterMode::Substring, smartcase: true },
-            preview: PreviewCfg { enabled: true, debounce_ms: 40, max_bytes: 256 * 1024 },
+            preview: PreviewCfg { enabled: true, debounce_ms: 40, max_bytes: 256 * 1024, kitim: false },
             theme: Theme::default(),
             previewers: Vec::new(),
             plugins: default_plugins(),
@@ -198,6 +220,7 @@ impl Config {
             if let Some(v) = p.get("max_bytes").and_then(|v| v.as_integer()) {
                 self.preview.max_bytes = (v.max(1024) as usize).min(16 * 1024 * 1024);
             }
+            get_bool(p, "kitim", &mut self.preview.kitim);
         }
         // [[previewer]] rules
         if let Some(rules) = t.get("previewer").and_then(|v| v.as_array()) {
@@ -217,8 +240,14 @@ impl Config {
                     errs.push("[[previewer]] missing `match`".into());
                     continue;
                 }
-                self.previewers.push(PreviewerRule { patterns, cmd });
+                let mut graphics = false;
+                get_bool(tbl, "graphics", &mut graphics);
+                self.previewers.push(PreviewerRule { patterns, cmd, graphics });
             }
+        }
+        // After the user's rules: first match wins, so theirs take precedence.
+        if self.preview.kitim {
+            self.previewers.push(kitim_rule());
         }
         // [[plugin]] definitions
         if let Some(rules) = t.get("plugin").and_then(|v| v.as_array()) {
@@ -428,6 +457,34 @@ requires = ["fzf", "find"]
         let tree = cfg.plugins.iter().find(|p| p.name == "tree").unwrap();
         assert_eq!((tree.cmd.as_str(), tree.key.as_deref()), ("> tree -a -L 1", Some("T")));
         assert_eq!(cfg.plugins.last().unwrap().requires, ["fzf", "find"]);
+    }
+
+    #[test]
+    fn kitim_plugin_is_off_until_enabled_and_yields_to_user_rules() {
+        let cfg = Config::default();
+        assert!(!cfg.preview.kitim && cfg.previewers.is_empty());
+
+        let mut cfg = Config::default();
+        let t: toml::Table = r#"
+[preview]
+kitim = true
+
+[[previewer]]
+match = ["*.png"]
+run = "my-viewer"
+graphics = true
+"#
+        .parse()
+        .unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert_eq!(cfg.previewers.len(), 2);
+        assert_eq!(cfg.previewers[0].cmd, "my-viewer");
+        assert!(cfg.previewers[0].graphics);
+        let kitim = &cfg.previewers[1];
+        assert_eq!((kitim.cmd.as_str(), kitim.graphics), ("kitim --preview", true));
+        for name in ["*.jpg", "*.JPG", "*.mp4", "*.MOV", "*.gif"] {
+            assert!(kitim.patterns.iter().any(|p| p == name), "{name}");
+        }
     }
 
     #[test]

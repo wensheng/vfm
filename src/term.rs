@@ -1,7 +1,9 @@
-//! Host terminal detection: sorts the terminal vfm runs in into a [`Kind`].
+//! Host terminal detection: sorts the terminal vfm runs in into a [`Kind`],
+//! and finds out whether it can show kitty graphics.
 //!
 //! Vivid advertises itself through two environment variables, so it is known
-//! at once. Kitty graphics support is probed rather than guessed from the
+//! at once; whether it can show graphics is still probed, like any other
+//! terminal. Kitty graphics support is probed rather than guessed from the
 //! terminal's name, because kitty, Ghostty, Konsole and others all implement
 //! the protocol. [`detect`] follows the protocol spec: it sends a
 //! graphics *query action* followed by DA1 (primary device attributes).
@@ -18,7 +20,8 @@
 //! lost. The thread reads its own nonblocking descriptor, so it always quits
 //! by [`DEADLINE`] instead of lingering in `read()` to steal later input.
 //!
-//! Probing needs a Unix tty. Elsewhere, every terminal but Vivid is `Other`.
+//! Probing needs a Unix tty. Elsewhere, every terminal but Vivid is `Other`,
+//! and none shows graphics.
 
 // Rust guideline compliant 2026-10-07
 
@@ -57,20 +60,33 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// Terminal category vfm is running inside.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// The Vivid terminal; wins outright, so it is never probed.
+    /// The Vivid terminal, whether or not it shows graphics.
     Vivid,
-    /// A terminal that answers the kitty graphics protocol query.
+    /// Any other terminal that answers the kitty graphics protocol query.
     KittyGraphics,
     /// Anything else, including terminals the probe couldn't reach.
     #[default]
     Other,
 }
 
+impl Kind {
+    /// The category once the probe has found whether graphics work.
+    ///
+    /// Vivid stays Vivid either way; any other terminal is sorted by the result.
+    pub fn settle(self, graphics: bool) -> Kind {
+        match self {
+            Kind::Vivid => Kind::Vivid,
+            _ if graphics => Kind::KittyGraphics,
+            _ => Kind::Other,
+        }
+    }
+}
+
 /// What the probe found once it finished reading the tty.
 #[derive(Debug, Default)]
 pub struct Report {
-    /// [`Kind::KittyGraphics`] or [`Kind::Other`]; the probe never sees Vivid.
-    pub kind: Kind,
+    /// The terminal answered the kitty graphics query.
+    pub graphics: bool,
     /// Keys typed while the probe owned tty input, to be handled in order.
     pub typeahead: Vec<KeyEvent>,
 }
@@ -93,11 +109,11 @@ impl Probe {
     }
 }
 
-/// Classifies the host terminal, probing it in the background if needed.
+/// Classifies the host terminal and starts probing it for graphics.
 ///
-/// Returns the final [`Kind`] right away when the environment settles it or
-/// no probe can run. Otherwise returns [`Kind::Other`] plus a [`Probe`] whose
-/// report supersedes it; nothing else may read tty input until it arrives.
+/// Returns [`Kind::Vivid`] or [`Kind::Other`] from the environment, plus a
+/// [`Probe`] unless no tty can be probed. Pass its report to [`Kind::settle`]
+/// for the final category. Nothing else may read tty input until it arrives.
 ///
 /// Call this with raw mode on, so the replies are neither echoed nor held for
 /// a newline, and before the first frame, which paints over anything a
@@ -110,10 +126,8 @@ impl Probe {
 pub fn detect() -> (Kind, Option<Probe>) {
     let control = std::env::var_os("VIVID_ENDPOINT_CONTROL");
     let secret = std::env::var_os("VIVID_ROOT_SECRET");
-    if vivid_advertised(control.as_deref(), secret.as_deref()) {
-        return (Kind::Vivid, None);
-    }
-    (Kind::Other, spawn_probe())
+    let kind = if vivid_advertised(control.as_deref(), secret.as_deref()) { Kind::Vivid } else { Kind::Other };
+    (kind, spawn_probe())
 }
 
 /// Whether Vivid's endpoint is advertised: both variables set and non-empty.
@@ -182,8 +196,7 @@ fn collect(tty: &mut impl Read, deadline: Instant) -> Report {
     if pending == [0x1b] {
         scan.keys.push(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     }
-    let kind = if scan.graphics { Kind::KittyGraphics } else { Kind::Other };
-    Report { kind, typeahead: scan.keys }
+    Report { graphics: scan.graphics, typeahead: scan.keys }
 }
 
 /// What the probe has learned from tty input so far.
@@ -412,23 +425,31 @@ mod tests {
     #[test]
     fn graphics_reply_before_da1_means_supported() {
         let r = probe(KITTY);
-        assert_eq!(r.kind, Kind::KittyGraphics);
+        assert!(r.graphics);
         assert!(r.typeahead.is_empty(), "{:?}", r.typeahead);
         // Whole-buffer reads take the same path as a byte at a time.
-        assert_eq!(collect(&mut &KITTY[..], far()).kind, Kind::KittyGraphics);
+        assert!(collect(&mut &KITTY[..], far()).graphics);
     }
 
     #[test]
     fn error_reply_still_means_supported() {
         let r = probe(b"\x1b_Gi=31;EINVAL:bad format\x1b\\\x1b[?62;c");
-        assert_eq!(r.kind, Kind::KittyGraphics);
+        assert!(r.graphics);
     }
 
     #[test]
     fn da1_alone_means_unsupported() {
-        assert_eq!(probe(b"\x1b[?62;22c").kind, Kind::Other);
+        assert!(!probe(b"\x1b[?62;22c").graphics);
         // Another image id isn't an answer to our query.
-        assert_eq!(probe(b"\x1b_Gi=7;OK\x1b\\\x1b[?6c").kind, Kind::Other);
+        assert!(!probe(b"\x1b_Gi=7;OK\x1b\\\x1b[?6c").graphics);
+    }
+
+    #[test]
+    fn vivid_keeps_its_kind_whatever_the_probe_finds() {
+        assert_eq!(Kind::Vivid.settle(true), Kind::Vivid);
+        assert_eq!(Kind::Vivid.settle(false), Kind::Vivid);
+        assert_eq!(Kind::Other.settle(true), Kind::KittyGraphics);
+        assert_eq!(Kind::Other.settle(false), Kind::Other);
     }
 
     #[test]
@@ -439,7 +460,7 @@ mod tests {
         // The Trickle stops at the DA1 reply, so feed everything at once:
         // keys after DA1 in the same read belong to the user too.
         let r = collect(&mut &input[..], far());
-        assert_eq!(r.kind, Kind::KittyGraphics);
+        assert!(r.graphics);
         let up = key(KeyCode::Up, KeyModifiers::NONE);
         let shift_g = key(KeyCode::Char('G'), KeyModifiers::SHIFT);
         let esc = key(KeyCode::Esc, KeyModifiers::NONE);
@@ -478,7 +499,7 @@ mod tests {
     #[test]
     fn cut_short_apc_does_not_swallow_da1() {
         let r = probe(b"\x1b_Gi=31;O\x1b[?62c");
-        assert_eq!(r.kind, Kind::Other);
+        assert!(!r.graphics);
         assert!(r.typeahead.is_empty(), "{:?}", r.typeahead);
     }
 
@@ -487,14 +508,14 @@ mod tests {
         let t0 = Instant::now();
         let r = collect(&mut Trickle(b"k"), t0 + Duration::from_millis(30));
         assert!(t0.elapsed() >= Duration::from_millis(30));
-        assert_eq!(r.kind, Kind::Other);
+        assert!(!r.graphics);
         assert_eq!(r.typeahead, [chr('k')]);
     }
 
     #[test]
     fn hangup_ends_probe() {
         let r = collect(&mut &b"k"[..], far());
-        assert_eq!(r.kind, Kind::Other);
+        assert!(!r.graphics);
         assert_eq!(r.typeahead, [chr('k')]);
     }
 
@@ -503,6 +524,6 @@ mod tests {
         let (tx, p) = Probe::channel();
         assert!(p.wait(Duration::ZERO).is_none(), "still probing");
         drop(tx);
-        assert_eq!(p.wait(Duration::ZERO).map(|r| r.kind), Some(Kind::Other));
+        assert_eq!(p.wait(Duration::ZERO).map(|r| r.graphics), Some(false));
     }
 }

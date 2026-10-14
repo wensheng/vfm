@@ -3,15 +3,16 @@
 A small, fast terminal file manager in safe Rust.
 Linux, macOS and Windows.
 
-- **Small:** ~1.2 MB stripped binary; 5 dependencies (crossterm, unicode-width,
-  toml, regex-lite, trash).
+- **Small:** ~1.2 MB stripped binary; 6 dependencies (crossterm, unicode-width,
+  toml, regex-lite, trash, and libc on Unix).
 - **Fast:** one directory in memory, 40-byte entries, lazy sorting, and a
   two-line redraw for cursor moves. Measured: ~3 ms to load and render a
   2,700-entry dir, ~12 ms for 20,000 entries, 4.4 MB RSS.
 - **Safe:** no `unsafe`, no `Mutex`. Workers talk to the UI over channels and
   atomics only.
 - **Plugins for preview:** any command that prints to stdout (ANSI colors
-  supported) can be a previewer.
+  supported) can be a previewer. Image and video previews, through
+  [kitim](https://github.com/wensheng/kitim), on terminals with kitty graphics.
 
 ## Build
 
@@ -86,6 +87,7 @@ smartcase = true
 enabled     = true
 debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
+kitim       = false       # image/video previews via kitim (see "Built-in plugin: kitim")
 
 [colors]                  # name, 0-255, or 0xRRGGBB
 dir = "blue"
@@ -100,6 +102,7 @@ quit = "C-x"
 [[previewer]]             # first matching rule wins
 match = ["*.rs", "*.toml", "*.md"]
 run   = "bat --color=always --style=plain"
+# graphics = true         # run prints kitty graphics, not text (see below)
 
 [[plugin]]
 name     = "git status"
@@ -118,6 +121,52 @@ SGR colors and strips other escape sequences. With no matching rule, a built-in
 preview shows text heads, directory listings, symlink targets, and binary file
 types. Moving the cursor kills a slow previewer immediately; recent results are
 cached.
+
+### Graphics previewers
+
+A `[[previewer]]` with `graphics = true` draws images instead of text. It runs
+the same way, as `<run…> PATH WIDTH HEIGHT`, where WIDTH and HEIGHT are the
+pane's body in cells. vfm only uses such a rule if the terminal answered its
+kitty graphics probe at startup, as terminals implementing the protocol do
+(kitty and Ghostty, for example).
+Elsewhere, and inside tmux, the next matching rule or the built-in preview is
+used instead.
+
+Its stdout is a stream of frames. Each frame is optional cursor moves (`CSI n
+A`/`B`/`C`/`D`, relative to the pane's top-left cell) followed by one kitty
+graphics `a=T` image, chunked with `m=1` on every chunk but the last. Each
+frame should have its own `i=` image id: vfm puts a new frame up, then deletes
+the previous one, so animations don't flicker. vfm forwards only those
+sequences, and forces `q=2` and `C=1`, so a previewer can't move the screen or
+make the terminal answer on vfm's input. Plain text that isn't part of a frame
+is shown as the error when no frame arrives.
+
+### Built-in plugin: kitim
+
+vfm ships one graphics previewer, off by default. Install a
+[kitim](https://github.com/wensheng/kitim) that has `--preview`, then enable it
+in `config.toml`:
+
+```toml
+[preview]
+kitim = true
+```
+
+That previews images (png, jpg, gif, webp, bmp, ico, tiff, tga, qoi, pnm) and
+videos (mp4, m4v, mkv, webm, mov, avi, wmv, flv, mpg, mpeg, 3gp), in lower or
+upper case. Animated GIFs and videos play muted and loop until you move the
+cursor. The switch adds this rule after your own `[[previewer]]` rules, so
+yours win for the files they match:
+
+```toml
+[[previewer]]
+match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
+run      = "kitim --preview"
+graphics = true
+```
+
+To run a kitim that isn't on `PATH`, or for other file types, write that rule
+yourself with the path in `run`.
 
 ### Plugin modes
 

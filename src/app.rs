@@ -9,6 +9,7 @@ use crate::context::{Context, CTX_MAX};
 use crate::dir::Dir;
 use crate::entry::{Entry, EntryFlags};
 use crate::filter::{FilterMode, Matcher};
+use crate::graphics;
 use crate::ops::{self, OpHandle, OpKind, OpRequest};
 use crate::plugin::{self, Reply, SpawnMode};
 use crate::preview::{make_sig, Preview, Source, Target, Tick as PreviewTick};
@@ -82,6 +83,19 @@ pub struct Pin {
     pub plugin: usize,
     /// Pane state to restore on unpin (it may have been opened just for this).
     pub was_enabled: bool,
+}
+
+/// Poll interval while a graphics preview animates: frames are picked up
+/// between polls, so this caps playback near 60 fps. The 30 ms busy poll
+/// would cap it at 33 fps and add judder to 24 and 30 fps video.
+const ANIMATION_TICK: Duration = Duration::from_millis(15);
+
+/// The preview image on screen: which frame, where, and its id for deleting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shown {
+    seq: u64,
+    origin: (u16, u16),
+    id: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -235,8 +249,12 @@ pub struct App {
     pub home: Option<PathBuf>,
     /// Host terminal category; `Other` until the probe (if any) reports.
     pub term: term::Kind,
+    /// The terminal answered the kitty graphics probe: graphics previewers run.
+    pub graphics: bool,
     /// Terminal probe in flight: its thread owns tty input until it reports.
     pub probe: Option<term::Probe>,
+    /// Preview image currently on screen, if any.
+    shown: Option<Shown>,
     keymap: std::collections::HashMap<KeyEvent, Action>,
     last_cursor: usize,
     last_scroll: usize,
@@ -302,7 +320,9 @@ impl App {
             start_dir,
             home,
             term: term::Kind::Other,
+            graphics: false,
             probe: None,
+            shown: None,
             keymap,
             last_cursor: 0,
             last_scroll: 0,
@@ -317,6 +337,14 @@ impl App {
     // ------------------------------------------------------------ loop
 
     pub fn run(&mut self) -> Flow {
+        let flow = self.event_loop();
+        // Images outlive vfm's text unless deleted.
+        self.hide_graphics();
+        self.screen.flush();
+        flow
+    }
+
+    fn event_loop(&mut self) -> Flow {
         loop {
             self.render();
             let timeout = self.poll_timeout();
@@ -356,7 +384,12 @@ impl App {
     /// Records the terminal probe's verdict and replays the keys it swallowed.
     fn settle_term(&mut self, report: term::Report) -> Option<Flow> {
         self.probe = None;
-        self.term = report.kind;
+        self.graphics = report.graphics;
+        self.term = self.term.settle(report.graphics);
+        // Graphics previewers were skipped until now; re-pick the hovered one.
+        if self.graphics && self.cfg.previewers.iter().any(|r| r.graphics) {
+            self.preview_supersede();
+        }
         report.typeahead.into_iter().find_map(|k| self.handle_event(Event::Key(k)))
     }
 
@@ -366,7 +399,8 @@ impl App {
             return Duration::ZERO;
         }
         if self.preview.is_busy() {
-            return Duration::from_millis(30);
+            // A running job that has drawn a frame is playing an animation.
+            return if self.preview.image().is_some() { ANIMATION_TICK } else { Duration::from_millis(30) };
         }
         if self.op.is_some() {
             return Duration::from_millis(100);
@@ -381,7 +415,8 @@ impl App {
     fn on_tick(&mut self) -> Option<Flow> {
         // 1. preview debounce → spawn / chunk drain
         let ptick = self.preview.tick(Instant::now());
-        if ptick != PreviewTick::Quiet {
+        // A new frame only swaps the image, which render() does every pass.
+        if !matches!(ptick, PreviewTick::Quiet | PreviewTick::Frame) {
             self.dirty = Dirty::Full;
         }
         // 2. op progress
@@ -1044,6 +1079,9 @@ impl App {
         });
         let mut env = plugin::child_env(&dir, hovered.as_deref(), sel_file.as_deref(), self.ctx_i as u8);
         env.extend(extra_env);
+        // Re-entering the alternate screen wipes images; render() re-sends.
+        self.hide_graphics();
+        self.screen.flush();
         self.screen.leave();
         let res = plugin::run_fullscreen(cmdline, &dir, &env);
         let _ = self.screen.enter();
@@ -1420,14 +1458,20 @@ impl App {
         let Some(path) = self.dir.hovered_path() else { return };
         let rule = self.match_previewer(&e.name);
         let sig = make_sig(&path, e.size, e.mtime, (pw, self.screen.h), rule.unwrap_or(usize::MAX));
-        let source = match rule {
-            Some(i) => {
-                let c = &self.cfg.previewers[i].cmd;
-                Source::Previewer(crate::util::shlex(c).unwrap_or_else(|| vec![c.clone()]))
+        let mut pane = (pw, self.screen.h);
+        let source = match rule.map(|i| &self.cfg.previewers[i]) {
+            Some(r) => {
+                let argv = crate::util::shlex(&r.cmd).unwrap_or_else(|| vec![r.cmd.clone()]);
+                if r.graphics {
+                    // Exactly the body: an image may fill every cell it's given.
+                    pane = (pw - 1, self.screen.list_rows() as u16);
+                    Source::Graphics(argv)
+                } else {
+                    Source::Previewer(argv)
+                }
             }
             None => Source::Builtin,
         };
-        let pane = (pw, self.screen.h);
         let env = plugin::child_env(
             &self.dir.path,
             Some(&path),
@@ -1478,11 +1522,13 @@ impl App {
         self.dirty = Dirty::Full;
     }
 
+    /// First rule matching `name`; graphics rules only if the terminal can.
     fn match_previewer(&self, name: &str) -> Option<usize> {
         self.cfg.previewers.iter().position(|r| {
-            r.patterns
-                .iter()
-                .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
+            (self.graphics || !r.graphics)
+                && r.patterns
+                    .iter()
+                    .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
         })
     }
 
@@ -1637,18 +1683,64 @@ impl App {
             self.finish_op(res);
             self.dirty = Dirty::Full;
         }
-        if self.dirty == Dirty::None {
-            return;
-        }
         if self.dirty == Dirty::TwoLines && self.fast_two_lines_ok() {
             self.fast_two_lines();
-            self.dirty = Dirty::None;
-            self.screen.flush();
-            return;
+        } else if self.dirty != Dirty::None {
+            self.render_full();
         }
         self.dirty = Dirty::None;
-        self.render_full();
+        // After the text, so the image goes over a freshly cleared pane.
+        self.sync_graphics();
         self.screen.flush();
+    }
+
+    /// Top-left cell of the pane body while an image may show there: the
+    /// pane is open and no overlay (menu, pager) covers it.
+    fn graphics_origin(&self) -> Option<(u16, u16)> {
+        let (pane_w, _) = self.preview_pane()?;
+        if matches!(self.mode, Mode::Menu(_) | Mode::Pager { .. }) {
+            return None;
+        }
+        Some((2, self.screen.w - pane_w + 1))
+    }
+
+    /// Puts the preview's image on screen, or takes it off, to match the pane.
+    ///
+    /// Images sit above the text and survive text redraws, so output is only
+    /// needed when the wanted frame changes. A new frame goes up before the
+    /// old one is deleted, so animations don't flicker; terminals draw the
+    /// newer image id on top. A frame without an id can't be deleted alone,
+    /// so every image is cleared before it goes up.
+    fn sync_graphics(&mut self) {
+        let origin = self.graphics_origin();
+        let frame = origin.and(self.preview.image());
+        let old = self.shown;
+        if old.map(|s| (s.seq, Some(s.origin))) == frame.map(|(seq, _)| (seq, origin)) {
+            return;
+        }
+        let buf = &mut self.screen.buf;
+        let (Some(origin), Some((seq, frame))) = (origin, frame) else {
+            if let Some(old) = self.shown.take() {
+                graphics::delete(buf, old.id);
+            }
+            return;
+        };
+        if old.is_some() && frame.id.is_none() {
+            graphics::delete(buf, None);
+        }
+        self.screen.move_to(origin.0, origin.1);
+        self.screen.buf.extend_from_slice(&frame.bytes);
+        if let Some(old_id) = old.and_then(|s| s.id).filter(|&id| Some(id) != frame.id) {
+            graphics::delete(&mut self.screen.buf, Some(old_id));
+        }
+        self.shown = Some(Shown { seq, origin, id: frame.id });
+    }
+
+    /// Takes the preview image off screen (output is queued, not flushed).
+    fn hide_graphics(&mut self) {
+        if let Some(old) = self.shown.take() {
+            graphics::delete(&mut self.screen.buf, old.id);
+        }
     }
 
     /// The fast path applies only when the scroll window stays put. Scroll is
@@ -1893,9 +1985,11 @@ impl App {
             Some(def) => format!("{}: {}", def.name, tilde_path(&self.dir.path, self.home.as_deref())),
             None => self.dir.hovered_name().unwrap_or("").to_string(),
         };
+        let image = self.preview.image().map(|(seq, _)| seq);
         let state = match (&self.preview.state, self.preview.error()) {
             (_, Some(e)) => format!("error: {e}"),
-            (crate::preview::PreviewState::Running { .. }, _) => "…".into(),
+            // A running job with a frame up is playing, not loading.
+            (crate::preview::PreviewState::Running { .. }, _) if image.is_none() => "…".into(),
             (crate::preview::PreviewState::Debounce { .. }, _) => "…".into(),
             _ => String::new(),
         };
@@ -1910,7 +2004,11 @@ impl App {
         }
         self.screen.put_line_at(1, x as u16, &meta, pane_w, theme.preview_meta);
 
-        // Body.
+        // Body. Leave it alone under an image that is up: on terminals that
+        // attach images to cells, writing those cells erases the image.
+        if image.is_some() && image == self.shown.map(|s| s.seq) {
+            return;
+        }
         let rows = self.screen.list_rows();
         let mut r = 2u16;
         if let Some((lines, _trunc)) = self.preview.lines() {
@@ -2307,12 +2405,12 @@ mod tests {
         let reporter = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             let typeahead = vec![KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)];
-            tx.send(term::Report { kind: term::Kind::KittyGraphics, typeahead }).unwrap();
+            tx.send(term::Report { graphics: true, typeahead }).unwrap();
         });
         assert_eq!(app.run(), Flow::Quit(0)); // trailing C-q
         reporter.join().unwrap();
         assert_eq!(app.term, term::Kind::KittyGraphics);
-        assert!(app.probe.is_none());
+        assert!(app.graphics && app.probe.is_none());
         assert_eq!(app.dir.hovered_name(), Some("beta"));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2639,6 +2737,118 @@ mod tests {
         app.preview.lines().map(|(l, _)| l.iter().map(|l| l.text()).collect()).unwrap_or_default()
     }
 
+    /// An app on `pic.png` + `notes.txt`, with a graphics previewer for
+    /// `*.png` whose frame's image id is the pane size it was given ("WH").
+    #[cfg(unix)]
+    fn graphics_app(name: &str) -> (App, PathBuf, SharedBuf) {
+        let d = tmpdir(name);
+        std::fs::write(d.join("pic.png"), b"png").unwrap();
+        std::fs::write(d.join("notes.txt"), b"text\n").unwrap();
+        let previewers = vec![crate::config::PreviewerRule {
+            patterns: vec!["*.png".into()],
+            cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
+            graphics: true,
+        }];
+        let cfg = Config { previewers, ..Config::default() };
+        let out = SharedBuf::default();
+        let screen = Screen::new(Box::new(out.clone()), 120, 30);
+        let mut app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        app.preview.debounce = Duration::ZERO;
+        app.preview.enabled = true;
+        app.graphics = true;
+        app.dir.move_to_name("pic.png");
+        (app, d, out)
+    }
+
+    /// The pane body's top-left cell on a 120x30 screen, as a CUP sequence.
+    #[cfg(unix)]
+    const BODY_ORIGIN: &str = "\x1b[3;63H";
+
+    #[cfg(unix)]
+    #[test]
+    fn graphics_previews_need_the_probe_and_fill_the_pane_body() {
+        let (mut app, d, _) = graphics_app("gfxprobe");
+        app.graphics = false;
+        app.preview_on_hover();
+        drive_preview(&mut app);
+        assert!(app.preview.image().is_none(), "graphics rule ran without graphics");
+        assert!(preview_texts(&app)[0].starts_with("png"), "{:?}", preview_texts(&app));
+
+        // The probe's report re-picks the previewer for the hovered file.
+        let report = term::Report { graphics: true, typeahead: Vec::new() };
+        assert_eq!(app.settle_term(report), None);
+        drive_preview(&mut app);
+        // 120 cols: a 59-col pane minus its padding column; 30 rows minus 3.
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5827)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_image_follows_hover_overlays_and_quit() {
+        let (mut app, d, out) = graphics_app("gfxshow");
+        app.preview_on_hover();
+        drive_preview(&mut app);
+        app.dirty = Dirty::Full;
+        app.render();
+        // The body is blanked first, then the image goes over it.
+        let frame = out.take();
+        let at = frame.rfind(BODY_ORIGIN).expect("cursor to the pane body");
+        assert!(frame[at..].starts_with("\x1b[3;63H\x1b_Ga=T,i=5827,q=2,C=1;AAAA\x1b\\"), "{:?}", &frame[at..]);
+        assert!(frame[..at].contains("\x1b[29;63H"), "body rows blanked under the image");
+
+        // Redraws neither resend the image nor write the body under it.
+        app.dirty = Dirty::Full;
+        app.render();
+        let redraw = out.take();
+        assert!(!redraw.contains(BODY_ORIGIN) && !redraw.contains("\x1b_G"), "{redraw:?}");
+
+        // Overlays take the image down; closing them puts it back.
+        act(&mut app, Action::PluginMenu);
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        act(&mut app, Action::Esc);
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=T,i=5827"));
+
+        // Hovering a text file deletes the image before its preview is ready.
+        act(&mut app, Action::Next);
+        assert_eq!(app.dir.hovered_name(), Some("notes.txt"));
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+
+        // Quitting with an image up deletes it.
+        act(&mut app, Action::Prev);
+        drive_preview(&mut app);
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=T,i=5827"));
+        assert_eq!(app.run(), Flow::Quit(0)); // TestSource sends C-q
+        assert!(out.take().ends_with("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_frames_go_up_before_the_old_one_is_deleted() {
+        let (mut app, d, out) = graphics_app("gfxswap");
+        app.cfg.previewers[0].cmd =
+            r#"sh -c "printf '\033_Ga=T,i=1;AAAA\033\\\\'; sleep 0.2; printf '\033_Ga=T,i=2;AAAA\033\\\\'""#.into();
+        app.preview_on_hover();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        while app.preview.is_busy() && Instant::now() < deadline {
+            app.on_tick();
+            app.render();
+            output.push_str(&out.take());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let second = output.find("\x1b_Ga=T,i=2").expect("second frame");
+        let delete = output.find("\x1b_Ga=d,d=I,i=1,q=2").expect("first frame deleted");
+        assert!(output.find("\x1b_Ga=T,i=1").unwrap() < second && second < delete, "{output:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[cfg(unix)]
     #[test]
     fn preview_plugin_pins_pane_until_navigation() {
@@ -2827,6 +3037,7 @@ mod tests {
         cfg.previewers = vec![crate::config::PreviewerRule {
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
+            graphics: false,
         }];
         let src = TestSource::new();
         let screen = Screen::new(Box::new(Vec::new()), 120, 30);

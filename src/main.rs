@@ -11,6 +11,7 @@ mod context;
 mod dir;
 mod entry;
 mod filter;
+mod graphics;
 mod ops;
 mod plugin;
 mod preview;
