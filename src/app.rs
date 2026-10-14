@@ -296,6 +296,7 @@ impl App {
             cfg.preview.max_bytes,
         );
         preview.enabled = cfg.ui.preview && cfg.preview.enabled;
+        preview.highlight = crate::preview::bat_argv(cfg.preview.bat, plugin::which);
         let mut app = App {
             detail: cfg.ui.detail,
             ctx_active: 1,
@@ -331,6 +332,8 @@ impl App {
         };
         app.apply_ctx_sort_and_filter();
         app.sync_selection_flags();
+        // A pane open at startup previews the first entry without a keypress.
+        app.preview_on_hover();
         Ok(app)
     }
 
@@ -2341,6 +2344,7 @@ mod tests {
         let mut app = App::new(Config::default(), d.clone(), screen, Box::new(src)).unwrap();
         // Never touch the real ~/.config/vfm/selection from tests.
         app.sel.file = std::env::temp_dir().join(format!("vfm-sel-{name}-{}", std::process::id()));
+        app.preview.highlight = None; // the same output whether or not bat is installed
         (app, d)
     }
 
@@ -2754,6 +2758,7 @@ mod tests {
         let screen = Screen::new(Box::new(out.clone()), 120, 30);
         let mut app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
         app.sel.file = d.join(".sel");
+        app.preview.highlight = None;
         app.preview.debounce = Duration::ZERO;
         app.preview.enabled = true;
         app.graphics = true;
@@ -3026,6 +3031,18 @@ mod tests {
         apply_key_config(&mut m, &[("quit".into(), "Z".into())]);
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE)], Action::Quit);
         assert!(!m.contains_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn preview_pane_open_at_startup_previews_the_first_entry() {
+        let d = tmpdir("pstart");
+        std::fs::write(d.join("a.txt"), b"first\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.ui.preview = true;
+        let screen = Screen::new(Box::new(Vec::new()), 120, 30);
+        let app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        assert!(app.preview.is_busy(), "no preview requested before the first keypress");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

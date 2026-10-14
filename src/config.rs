@@ -55,6 +55,8 @@ pub struct PreviewCfg {
     pub max_bytes: usize,
     /// The built-in kitim plugin: image and video previews, off by default.
     pub kitim: bool,
+    /// Highlight text previews with bat when it is installed.
+    pub bat: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +124,7 @@ impl Default for Config {
             },
             sort: SortCfg { key: SortKey::Name, reverse: false, dirs_first: true },
             filter: FilterCfg { mode: FilterMode::Substring, smartcase: true },
-            preview: PreviewCfg { enabled: true, debounce_ms: 40, max_bytes: 256 * 1024, kitim: false },
+            preview: PreviewCfg { enabled: true, debounce_ms: 40, max_bytes: 256 * 1024, kitim: false, bat: true },
             theme: Theme::default(),
             previewers: Vec::new(),
             plugins: default_plugins(),
@@ -221,6 +223,7 @@ impl Config {
                 self.preview.max_bytes = (v.max(1024) as usize).min(16 * 1024 * 1024);
             }
             get_bool(p, "kitim", &mut self.preview.kitim);
+            get_bool(p, "bat", &mut self.preview.bat);
         }
         // [[previewer]] rules
         if let Some(rules) = t.get("previewer").and_then(|v| v.as_array()) {
@@ -485,6 +488,15 @@ graphics = true
         for name in ["*.jpg", "*.JPG", "*.mp4", "*.MOV", "*.gif"] {
             assert!(kitim.patterns.iter().any(|p| p == name), "{name}");
         }
+    }
+
+    #[test]
+    fn bat_highlighting_is_on_unless_disabled() {
+        assert!(Config::default().preview.bat);
+        let mut cfg = Config::default();
+        let t: toml::Table = "[preview]\nbat = false\n".parse().unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert!(!cfg.preview.bat);
     }
 
     #[test]

@@ -88,6 +88,7 @@ enabled     = true
 debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
 kitim       = false       # image/video previews via kitim (see "Built-in plugin: kitim")
+bat         = true        # highlight text previews with bat (or batcat), if installed
 
 [colors]                  # name, 0-255, or 0xRRGGBB
 dir = "blue"
@@ -119,8 +120,10 @@ Environment: `VFM_SEL` (selection file path), `VFM_FCOLORS`
 **Previewers** run as `<run…> PATH WIDTH HEIGHT`, with stdout piped. vfm parses
 SGR colors and strips other escape sequences. With no matching rule, a built-in
 preview shows text heads, directory listings, symlink targets, and binary file
-types. Moving the cursor kills a slow previewer immediately; recent results are
-cached.
+types. If [bat](https://github.com/sharkdp/bat) is installed (as `bat` or
+`batcat`), text heads are syntax-highlighted through it; `bat = false` under
+`[preview]` keeps them plain. Moving the cursor kills a slow previewer
+immediately; recent results are cached.
 
 ### Graphics previewers
 

@@ -26,6 +26,24 @@ use std::time::{Duration, Instant};
 const MAX_LINES: usize = 20_000;
 const READ_BUF: usize = 64 * 1024;
 
+/// Bytes of a file's head checked to tell text from binary.
+const SNIFF_BYTES: usize = 8192;
+
+/// Programs tried, in order, for highlighted text previews. Debian and
+/// Ubuntu install bat as `batcat`.
+const BAT_NAMES: [&str; 2] = ["bat", "batcat"];
+
+/// bat flags for a pane: colors through the pipe, no decorations, no pager,
+/// and no wrapping, since the pane wraps lines itself.
+const BAT_FLAGS: [&str; 4] = ["--color=always", "--style=plain", "--paging=never", "--wrap=never"];
+
+/// The highlighter argv for text previews: bat, if `enabled` and
+/// `installed` finds it under one of its names.
+pub fn bat_argv(enabled: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+    let prog = BAT_NAMES.into_iter().filter(|_| enabled).find(|name| installed(name))?;
+    Some(std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect())
+}
+
 // ---------------------------------------------------------------- signature
 
 /// FNV-1a over path bytes, size, mtime, pane size and rule id — identical
@@ -227,6 +245,9 @@ pub struct Preview {
     frames: u64,
     pub debounce: Duration,
     pub max_bytes: usize,
+    /// Runs text files that no `[[previewer]]` rule matches (see [`bat_argv`]);
+    /// `None` keeps the built-in plain-text head.
+    pub highlight: Option<Vec<String>>,
     /// Snapshot taken at request() time; used when the debounce expires.
     pane: (u16, u16),
     env: Vec<(String, String)>,
@@ -246,6 +267,7 @@ impl Preview {
             frames: 0,
             debounce,
             max_bytes,
+            highlight: None,
             pane: (80, 24),
             env: Vec::new(),
             cwd: PathBuf::from("."),
@@ -415,14 +437,17 @@ impl Preview {
     fn start(&mut self, target: Target) -> Tick {
         let graphics = matches!(target.source, Source::Graphics(_));
         let command = match &target.source {
-            Source::Builtin => {
-                let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
-                let sig = target.sig;
-                let lines: std::sync::Arc<[Line]> = lines.into();
-                self.cache_put(sig, lines.clone(), truncated);
-                self.state = PreviewState::Done { sig, lines, truncated };
-                return Tick::Finished;
-            }
+            Source::Builtin => match self.highlighter(&target.path) {
+                Some(command) => command,
+                None => {
+                    let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
+                    let sig = target.sig;
+                    let lines: std::sync::Arc<[Line]> = lines.into();
+                    self.cache_put(sig, lines.clone(), truncated);
+                    self.state = PreviewState::Done { sig, lines, truncated };
+                    return Tick::Finished;
+                }
+            },
             Source::Previewer(argv) | Source::Graphics(argv) => {
                 let Some((prog, args)) = argv.split_first() else {
                     self.state = PreviewState::Failed { sig: target.sig, err: "empty command".into() };
@@ -453,6 +478,37 @@ impl Preview {
             }
         }
     }
+}
+
+impl Preview {
+    /// The highlighter command for `path` if it is a readable text file.
+    /// Binary files stay built-in: bat passes them through when piped.
+    /// Only lines that can show are asked for, since highlighting a large
+    /// file whole takes seconds.
+    fn highlighter(&self, path: &Path) -> Option<Command> {
+        let (prog, flags) = self.highlight.as_ref()?.split_first()?;
+        if !is_text_file(path) {
+            return None;
+        }
+        let mut c = Command::new(prog);
+        c.args(flags)
+            .arg(format!("--line-range=:{}", self.pane.1.max(1)))
+            .arg("--")
+            .arg(path)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .current_dir(&self.cwd);
+        Some(c)
+    }
+}
+
+/// A regular file (not a symlink) whose head reads as text.
+fn is_text_file(path: &Path) -> bool {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    let mut head = Vec::with_capacity(SNIFF_BYTES);
+    f.take(SNIFF_BYTES as u64).read_to_end(&mut head).is_ok() && !looks_binary(&head)
 }
 
 // ---------------------------------------------------------------- builtin
@@ -537,7 +593,7 @@ fn builtin_file(path: &Path, max_bytes: usize) -> (Vec<Line>, bool) {
 
 /// NUL in the head, or >10% control bytes, means "don't pretend this is text".
 fn looks_binary(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(8192)];
+    let head = &data[..data.len().min(SNIFF_BYTES)];
     if head.contains(&0) {
         return true;
     }
@@ -721,6 +777,40 @@ mod tests {
         tick_until(&mut pv, |pv| pv.error().is_some());
         assert_eq!(pv.error(), Some("no image"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_files_go_through_the_highlighter_and_the_rest_stays_builtin() {
+        let d = tmpdir("highlight");
+        std::fs::write(d.join("t.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(d.join("bin.dat"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
+        pv.set_context((40, 24), Vec::new(), &d);
+        // Echoes the arguments vfm appends.
+        let echo = r#"printf 'HL %s %s %s\n' "$1" "$2" "$3""#;
+        pv.highlight = Some(vec!["sh".into(), "-c".into(), echo.into(), "sh".into()]);
+        let mut show = |name: &str, sig| {
+            let target = Target { path: d.join(name), source: Source::Builtin, sig };
+            pv.request(target, Instant::now());
+            run_to_done(&mut pv);
+            pv.lines().unwrap().0.iter().map(|l| l.text()).collect::<Vec<_>>()
+        };
+        let path = d.join("t.rs").display().to_string();
+        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:24 -- {path}")]);
+        assert_eq!(show("bin.dat", 2)[0], "binary: PNG image");
+        assert!(show("sub", 3).is_empty(), "empty dir listing");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bat_is_found_under_either_name_unless_disabled() {
+        let flags = |prog: &str| std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect::<Vec<_>>();
+        assert_eq!(bat_argv(true, |p| p == "bat"), Some(flags("bat")));
+        assert_eq!(bat_argv(true, |p| p == "batcat"), Some(flags("batcat")));
+        assert_eq!(bat_argv(true, |_| false), None);
+        assert_eq!(bat_argv(false, |_| true), None);
     }
 
     #[test]
