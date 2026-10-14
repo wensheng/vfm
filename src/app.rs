@@ -2109,7 +2109,7 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "  C-g                quit + write cd path ($VFM_CD_FILE)",
         "",
         "  /                  filter (Enter keeps, Esc clears, C-n mode)",
-        "  t / C-t            sort key / reverse      T  time type",
+        "  s / C-t            sort key / reverse      T  time type",
         "  .                  show hidden     d            detail toggle",
         "  f                  file info       P            preview toggle",
         "  ?                  this help",
@@ -2229,13 +2229,13 @@ mod tests {
         std::fs::write(d.join("keep.txt"), b"k").unwrap();
         let src = TestSource::new();
         // n → New prompt; the typed text must NOT trigger bound actions
-        // (x = trash, d = detail, . = hidden, t = sort).
+        // (x = trash, d = detail, . = hidden, s = sort, t = tree).
         src.push(key('n'));
-        for c in "xd.t".chars() {
+        for c in "xd.st".chars() {
             src.push(key(c));
         }
         src.push(special(KeyCode::Backspace));
-        src.push(special(KeyCode::Enter)); // creates "xd."
+        src.push(special(KeyCode::Enter)); // creates "xd.s"
         // / filter: 'k' matches keep.txt only; Enter keeps it.
         src.push(key('/'));
         src.push(key('k'));
@@ -2248,7 +2248,7 @@ mod tests {
         app.sel.file = d.join(".sel");
         let flow = app.run();
         assert_eq!(flow, Flow::Quit(0)); // trailing C-q
-        assert!(d.join("xd.").is_file(), "prompt text was hijacked by keybindings");
+        assert!(d.join("xd.s").is_file(), "prompt text was hijacked by keybindings");
         assert!(app.detail, "'d' typed into the prompt toggled detail mode");
         assert_eq!(app.ctx[0].filter_text.as_deref(), Some("k"));
         assert_eq!(app.dir.nvisible(), 1);
@@ -2657,17 +2657,24 @@ mod tests {
     }
 
     #[test]
-    fn tree_plugin_bound_to_s_unless_keys_claims_it() {
+    fn tree_plugin_bound_to_t_and_sort_to_s_unless_keys_claim_t() {
+        let t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
         let s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
         let src = || Box::new(TestSource::new());
         let d = tmpdir("treekey");
-        let app = App::new(Config::default(), d.clone(), Screen::new(Box::new(io::sink()), 80, 24), src()).unwrap();
+        let mut app = App::new(Config::default(), d.clone(), Screen::new(Box::new(io::sink()), 80, 24), src()).unwrap();
         let i = app.cfg.plugins.iter().position(|p| p.name == "tree").unwrap();
-        assert_eq!(app.keymap[&s], Action::PluginRun(i));
+        assert_eq!(app.keymap[&t], Action::PluginRun(i));
+        assert_eq!(app.keymap[&s], Action::CycleSort);
+        let next_sort = app.ctx[app.ctx_i].sort.next();
+        assert_eq!(app.handle_event(key('s')), None);
+        assert_eq!(app.ctx[app.ctx_i].sort, next_sort);
+        assert_eq!(app.dir.sort, next_sort);
 
-        let cfg = Config { keys: vec![("select".into(), "s".into())], ..Config::default() };
+        let cfg = Config { keys: vec![("select".into(), "t".into())], ..Config::default() };
         let app = App::new(cfg, d.clone(), Screen::new(Box::new(io::sink()), 80, 24), src()).unwrap();
-        assert_eq!(app.keymap[&s], Action::Select);
+        assert_eq!(app.keymap[&t], Action::Select);
+        assert_eq!(app.keymap[&s], Action::CycleSort);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2690,7 +2697,7 @@ mod tests {
         app.preview.debounce = Duration::ZERO;
         for width in [120, 80] {
             app.screen = Screen::new(Box::new(io::sink()), width, 30);
-            app.handle_event(key('s'));
+            app.handle_event(key('t'));
             drive_preview(&mut app);
             let texts = if width >= 100 {
                 assert!(app.preview_pin.is_some());
@@ -2721,7 +2728,7 @@ mod tests {
         app.cd(&d.join("empty"));
         assert!(app.dir.hovered_path().is_none());
         app.preview.debounce = Duration::ZERO;
-        app.handle_event(key('s'));
+        app.handle_event(key('t'));
         drive_preview(&mut app);
         let texts = preview_texts(&app);
         assert_eq!(texts[0], app.dir.path.to_string_lossy(), "{texts:?}");

@@ -82,7 +82,7 @@ fn default_plugins() -> Vec<PluginDef> {
     vec![PluginDef {
         name: "tree".into(),
         cmd: cmd.into(),
-        key: Some("s".into()),
+        key: Some("t".into()),
         requires: vec!["tree".into()],
     }]
 }
@@ -402,7 +402,7 @@ dir = "cyan"
     fn builtin_tree_plugin_and_override() {
         let cfg = Config::default();
         let tree = cfg.plugins.iter().find(|p| p.name == "tree").unwrap();
-        assert_eq!(tree.key.as_deref(), Some("s"));
+        assert_eq!(tree.key.as_deref(), Some("t"));
         assert_eq!(tree.requires, ["tree"]);
         assert!(tree.cmd.starts_with('>'));
 

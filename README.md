@@ -38,8 +38,9 @@ Press `?` inside vfm for the full key list. The essentials:
 | `p` `v` `w` | copy / move selection here, copy as… |
 | `x` / `X` | trash / delete (confirm with `y`) |
 | `n`, `C-r` | new file (trailing `/` = dir), rename |
+| `s`, `C-t`, `T` | cycle sort key, reverse sort, cycle time type |
 | `P` | toggle preview pane (terminal ≥ 100 columns) |
-| `s` | tree view of the highlighted folder in the preview pane (needs `tree`) |
+| `t` | tree view of the highlighted folder in the preview pane (needs `tree`) |
 | `;` | plugin menu |
 | `q`, `C-q`, `C-g` | close context, quit, quit and cd |
 
@@ -139,7 +140,7 @@ vfm ships one plugin, equivalent to:
 [[plugin]]
 name     = "tree"
 cmd      = '> tree -C --dirsfirst -L 3 "${VFM_PATH:-$VFM_DIR}"'
-key      = "s"
+key      = "t"
 requires = "tree"
 ```
 
