@@ -2004,7 +2004,7 @@ impl App {
             let name = tilde_path(path, self.home.as_deref());
             let short = truncate_cols(&name, 28).0;
             let style = if i == self.ctx_i { theme.ctx_active } else { theme.ctx_inactive };
-            spans.push(Span { text: format!("{}:{} ", i + 1, short), style });
+            spans.push(Span { text: format!("{short} "), style });
         }
         let line = Line::from_spans(spans);
         self.screen.put_line(0, &line, self.screen.w as usize, Style::default());
@@ -2754,7 +2754,11 @@ mod tests {
         app.render();
         let frame = out.take();
         assert!(frame.contains("alpha"), "frame: {frame}");
-        assert!(frame.contains(&*d.to_string_lossy()));
+        let shown = tilde_path(&app.dir.path, app.home.as_deref());
+        assert!(frame.contains(&shown));
+        assert!(!frame.contains(&format!("1:{}", truncate_cols(&shown, 28).0)));
+        #[cfg(windows)]
+        assert!(!frame.contains(r"\\?\"), "verbatim prefix leaked into headers: {frame}");
         // Cursor row is reversed (SGR 7) and bold (1).
         assert!(frame.contains("\x1b[0;1;7m"), "cursor style missing: {frame}");
         // Detail view (the default) shows octal perms + size; light mode doesn't.

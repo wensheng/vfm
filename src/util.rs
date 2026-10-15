@@ -241,6 +241,11 @@ pub fn fmt_time_offset(unix: i64, now: i64, offset_secs: i32) -> String {
 
 /// Render a path with $HOME abbreviated to `~`.
 pub fn tilde_path(path: &Path, home: Option<&Path>) -> String {
+    // Compare display forms so canonical Windows paths still abbreviate HOME.
+    #[cfg(windows)]
+    let (shown, shown_home) = (windows_display_path(path), home.map(windows_display_path));
+    #[cfg(windows)]
+    let (path, home) = (Path::new(&shown), shown_home.as_deref().map(Path::new));
     let s = path.to_string_lossy();
     match home {
         Some(h) if path.starts_with(h) && h != Path::new("/") => {
@@ -248,6 +253,22 @@ pub fn tilde_path(path: &Path, home: Option<&Path>) -> String {
             if rest.is_empty() { "~".into() } else { format!("~{SEP}{rest}") }
         }
         _ => s.into(),
+    }
+}
+
+/// Hide Windows' verbatim marker while retaining drive and network roots.
+#[cfg(windows)]
+fn windows_display_path(path: &Path) -> String {
+    use std::path::{Component, Prefix};
+
+    let text = path.to_string_lossy();
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(_) => text.trim_start_matches(r"\\?\").to_owned(),
+            Prefix::VerbatimUNC(_, _) => format!(r"\\{}", text.trim_start_matches(r"\\?\UNC\")),
+            _ => text.into_owned(),
+        },
+        _ => text.into_owned(),
     }
 }
 
@@ -374,6 +395,37 @@ pub fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn tilde_path_hides_verbatim_markers_and_preserves_windows_roots() {
+        for (path, expected) in [
+            (r"\\?\F:\", r"F:\"),
+            (r"\\?\F:\some dir", r"F:\some dir"),
+            (r"\\?\UNC\server\share\folder", r"\\server\share\folder"),
+            (r"\\server\share\folder", r"\\server\share\folder"),
+            (r"F:\some dir", r"F:\some dir"),
+        ] {
+            assert_eq!(tilde_path(Path::new(path), None), expected);
+        }
+        let home = Path::new(r"C:\Users\person");
+        assert_eq!(tilde_path(Path::new(r"\\?\C:\Users\person"), Some(home)), "~");
+        assert_eq!(
+            tilde_path(Path::new(r"\\?\C:\Users\person\docs"), Some(home)),
+            r"~\docs"
+        );
+        assert_eq!(
+            tilde_path(
+                Path::new(r"C:\Users\person\docs"),
+                Some(Path::new(r"\\?\C:\Users\person"))
+            ),
+            r"~\docs"
+        );
+        assert_eq!(
+            tilde_path(Path::new(r"\\?\C:\Users\person2"), Some(home)),
+            r"C:\Users\person2"
+        );
+    }
 
     #[test]
     fn coolsize_goldens() {
