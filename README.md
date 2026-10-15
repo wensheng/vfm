@@ -69,6 +69,7 @@ vf() {
 [ui]
 show_hidden = false
 detail      = true        # perms/date/size columns
+nerd_font   = false       # file icons; enable with a Nerd Font in your terminal
 preview     = false       # preview pane on at startup
 wrap_nav    = true        # j on the last entry wraps to the first
 scrolloff   = 3
@@ -118,7 +119,19 @@ requires = "git"          # optional: program(s) that must be on PATH
 ```
 
 Environment: `VFM_SEL` (selection file path), `VFM_FCOLORS`
-(`dir=red:link=6:exec=0x88cc88`), `NO_COLOR`.
+(`dir=red:link=6:exec=0x88cc88`), `VFM_NERD_FONT`, `NO_COLOR`.
+
+For file-list icons, configure your terminal to use a [Nerd Font](https://www.nerdfonts.com/),
+then set `[ui] nerd_font = true`. Icons appear before filenames in both detailed
+and compact views, including Go (`U+E626`), Python (`U+E73C`), common file types,
+directories, and symbolic links. Unknown file types use a generic file icon.
+Selection marks, file colors, and `/`, `@`, `*` indicators still work as usual.
+
+Font glyph coverage cannot be detected reliably across terminals, so icons are
+off by default. `VFM_NERD_FONT=1` (or `true`) enables them for a session;
+`VFM_NERD_FONT=0` (or `false`) disables them. This overrides the config file;
+empty or unrecognized values leave the config unchanged. `NO_COLOR` affects
+colors independently of icons.
 
 ## Plugin protocol
 

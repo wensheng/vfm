@@ -31,6 +31,8 @@ pub struct Config {
 pub struct UiCfg {
     pub show_hidden: bool,
     pub detail: bool,
+    /// Show file icons when the terminal is configured with a Nerd Font.
+    pub nerd_font: bool,
     pub preview: bool,
     pub wrap_nav: bool,
     pub scrolloff: usize,
@@ -144,6 +146,7 @@ impl Default for Config {
             ui: UiCfg {
                 show_hidden: false,
                 detail: true,
+                nerd_font: false,
                 preview: false,
                 wrap_nav: true,
                 scrolloff: crate::dir::SCROLLOFF,
@@ -218,6 +221,7 @@ impl Config {
         if let Some(ui) = t.get("ui").and_then(|v| v.as_table()) {
             get_bool(ui, "show_hidden", &mut self.ui.show_hidden);
             get_bool(ui, "detail", &mut self.ui.detail);
+            get_bool(ui, "nerd_font", &mut self.ui.nerd_font);
             get_bool(ui, "preview", &mut self.ui.preview);
             get_bool(ui, "wrap_nav", &mut self.ui.wrap_nav);
             if let Some(v) = ui.get("scrolloff").and_then(|v| v.as_integer()) {
@@ -395,11 +399,21 @@ fn parse_color(s: &str) -> Option<Style> {
 /// NNN_FCOLORS-style env override: `dir=blue:exec=green:...`. Applied after
 /// the config file (env wins, nnn-style flag precedence).
 pub fn apply_env_overrides(cfg: &mut Config) {
-    apply_env(cfg, std::env::var("VFM_FCOLORS").ok().as_deref(), std::env::var_os("NO_COLOR").is_some());
+    apply_env(
+        cfg,
+        std::env::var("VFM_FCOLORS").ok().as_deref(),
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("VFM_NERD_FONT").ok().as_deref(),
+    );
 }
 
 /// Pure core of [`apply_env_overrides`] (env vars as arguments, testable).
-fn apply_env(cfg: &mut Config, fcolors: Option<&str>, no_color: bool) {
+fn apply_env(cfg: &mut Config, fcolors: Option<&str>, no_color: bool, nerd_font: Option<&str>) {
+    match nerd_font {
+        Some("1" | "true") => cfg.ui.nerd_font = true,
+        Some("0" | "false") => cfg.ui.nerd_font = false,
+        _ => {}
+    }
     for pair in fcolors.unwrap_or("").split(':') {
         let Some((k, v)) = pair.split_once('=') else { continue };
         let Some(style) = parse_color(v) else { continue };
@@ -434,14 +448,42 @@ mod tests {
     #[test]
     fn env_overrides() {
         let mut c = Config::default();
-        apply_env(&mut c, Some("dir=red:link=2:bogus=blue:exec"), false);
+        apply_env(&mut c, Some("dir=red:link=2:bogus=blue:exec"), false, None);
         assert_eq!(c.theme.dir, Style::fg(Color::Idx(1)));
         assert_eq!(c.theme.link, Style::fg(Color::Idx(2)));
         // NO_COLOR applies on its own, without VFM_FCOLORS set.
         let mut c = Config::default();
-        apply_env(&mut c, None, true);
+        apply_env(&mut c, None, true, None);
         assert_eq!(c.theme.dir, Style::default());
         assert_eq!(c.theme.exec, Style::default());
+    }
+
+    #[test]
+    fn nerd_font_is_opt_in_and_environment_overrides_config() {
+        let mut cfg = Config::default();
+        assert!(!cfg.ui.nerd_font);
+        for enabled in [true, false] {
+            let t = format!("[ui]\nnerd_font = {enabled}\n").parse().unwrap();
+            assert!(cfg.apply_table(&t).is_empty());
+            assert_eq!(cfg.ui.nerd_font, enabled);
+        }
+        for value in ["1", "true"] {
+            cfg.ui.nerd_font = false;
+            apply_env(&mut cfg, None, true, Some(value));
+            assert!(cfg.ui.nerd_font); // NO_COLOR only affects colors.
+        }
+        for value in ["0", "false"] {
+            cfg.ui.nerd_font = true;
+            apply_env(&mut cfg, None, false, Some(value));
+            assert!(!cfg.ui.nerd_font);
+        }
+        for enabled in [true, false] {
+            cfg.ui.nerd_font = enabled;
+            for value in [None, Some(""), Some("invalid")] {
+                apply_env(&mut cfg, None, false, value);
+                assert_eq!(cfg.ui.nerd_font, enabled);
+            }
+        }
     }
 
     #[test]

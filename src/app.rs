@@ -1817,7 +1817,7 @@ impl App {
             {
                 old = Some((self.last_cursor, entry_line(
                     &self.dir, self.last_cursor, w, detail, &theme,
-                    &self.sel, self.dir.path_at(self.last_cursor),
+                    &self.sel, self.cfg.ui.nerd_font,
                 )));
             }
             if self.dir.cursor >= self.dir.scroll
@@ -1826,7 +1826,7 @@ impl App {
             {
                 new = Some((self.dir.cursor, entry_line(
                     &self.dir, self.dir.cursor, w, detail, &theme,
-                    &self.sel, self.dir.path_at(self.dir.cursor),
+                    &self.sel, self.cfg.ui.nerd_font,
                 )));
             }
         }
@@ -1877,7 +1877,7 @@ impl App {
         let end = (scroll + rows).min(self.dir.nvisible());
         let mut row = 2u16;
         for i in scroll..end {
-            let line = entry_line(&self.dir, i, pw, self.detail, &theme, &self.sel, self.dir.path_at(i));
+            let line = entry_line(&self.dir, i, pw, self.detail, &theme, &self.sel, self.cfg.ui.nerd_font);
             let pad = if i == self.dir.cursor { theme.cursor } else { Style::default() };
             self.screen.put_line(row, &line, pw, pad);
             row += 1;
@@ -2125,7 +2125,7 @@ pub fn shquote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// One listing row: `ind name` (light) or `perm date size name` (detail).
+/// One listing row, with an optional Nerd Font icon before the name.
 fn entry_line(
     dir: &Dir,
     i: usize,
@@ -2133,15 +2133,14 @@ fn entry_line(
     detail: bool,
     theme: &Theme,
     sel: &Selection,
-    path: Option<PathBuf>,
+    nerd_font: bool,
 ) -> Line {
     let Some(e) = dir.entries.get(i) else { return Line::default() };
-    let selected = path.as_deref().map(|p| sel.contains(p)).unwrap_or(false)
-        || e.is_selected();
+    let selected = dir.path_at(i).as_deref().map(|p| sel.contains(p)).unwrap_or(false) || e.is_selected();
     let ind = if selected { "+" } else { " " };
     let ind_style = if selected { theme.selected } else { Style::default() };
     let style = entry_style(e, theme);
-    let mut spans = Vec::with_capacity(5);
+    let mut spans = Vec::with_capacity(if nerd_font { 6 } else { 5 });
     if detail {
         spans.push(Span {
             text: format!("{ind}{:03o} ", e.mode & 0o777),
@@ -2157,6 +2156,9 @@ fn entry_line(
         });
     } else {
         spans.push(Span { text: format!("{ind} "), style: ind_style });
+    }
+    if nerd_font {
+        spans.push(Span { text: format!("{} ", entry_icon(e)), style });
     }
     let used = spans.iter().map(|s| crate::ui::str_width(&s.text)).sum::<usize>();
     let avail = width.saturating_sub(used + 2);
@@ -2184,6 +2186,57 @@ fn entry_style(e: &Entry, theme: &Theme) -> Style {
         theme.hardlink
     } else {
         Style::default()
+    }
+}
+
+/// Picks a Nerd Font glyph from the entry type, filename, or extension.
+fn entry_icon(e: &Entry) -> char {
+    // Nerd Fonts' Font Awesome, Octicons, Seti, and Devicons codepoints.
+    // Links keep their own icon, including links to directories.
+    if e.is_symlink() {
+        return '\u{f481}'; // nf-oct-file_symlink_file
+    }
+    if e.is_dir() {
+        return '\u{f07b}'; // nf-fa-folder
+    }
+    match &*e.name {
+        "Cargo.toml" | "Cargo.lock" => return '\u{e7a8}',
+        "go.mod" | "go.sum" => return '\u{e626}',
+        "Dockerfile" | "Containerfile" => return '\u{e7b0}',
+        "Makefile" | "GNUmakefile" | "CMakeLists.txt" => return '\u{e615}',
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return '\u{e702}',
+        _ => {}
+    }
+    // Compare extensions in ASCII without changing the displayed filename.
+    let ext = e.ext().to_ascii_lowercase();
+    match ext.as_str() {
+        "go" => '\u{e626}',
+        "py" | "pyw" | "pyi" | "pyc" | "ipynb" => '\u{e73c}',
+        "rs" => '\u{e7a8}',
+        "js" | "mjs" | "cjs" | "jsx" => '\u{e74e}',
+        "ts" | "mts" | "cts" | "tsx" => '\u{e628}',
+        "c" | "h" => '\u{e61e}',
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => '\u{e61d}',
+        "cs" => '\u{e648}',
+        "java" | "class" | "jar" => '\u{e738}',
+        "rb" => '\u{e739}',
+        "php" => '\u{e73d}',
+        "lua" => '\u{e620}',
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => '\u{f489}',
+        "html" | "htm" => '\u{e736}',
+        "css" | "scss" | "sass" | "less" => '\u{e749}',
+        "json" | "jsonc" => '\u{e60b}',
+        "toml" | "yaml" | "yml" | "ini" | "conf" | "cfg" => '\u{e615}',
+        "md" | "markdown" => '\u{e73e}',
+        "txt" | "log" | "csv" | "tsv" => '\u{f15c}',
+        "pdf" => '\u{f1c1}',
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" | "tif" | "tiff" => '\u{f1c5}',
+        "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" => '\u{f1c7}',
+        "mp4" | "mkv" | "mov" | "webm" | "avi" | "m4v" => '\u{f1c8}',
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" => '\u{f1c6}',
+        "db" | "sqlite" | "sqlite3" | "sql" => '\u{f1c0}',
+        _ if e.flags.has(EntryFlags::EXEC) => '\u{f489}',
+        _ => '\u{f15b}', // nf-fa-file: unknown, extensionless, or non-UTF-8 names
     }
 }
 
@@ -2630,6 +2683,107 @@ mod tests {
         app.render();
         let frame = out.take();
         assert!(frame.contains("alpha") && !frame.contains(&perms), "light mode: {frame}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nerd_font_icons_follow_file_types_and_keep_directory_and_link_identity() {
+        let mut entry = Entry { name: "main.go".into(), size: 0, mtime: 0, mode: 0, flags: EntryFlags::default() };
+        for (name, icon) in [
+            ("main.go", '\u{e626}'),
+            ("main.GO", '\u{e626}'),
+            ("script.py", '\u{e73c}'),
+            ("script.PY", '\u{e73c}'),
+            ("types.pyi", '\u{e73c}'),
+            ("go.mod", '\u{e626}'),
+            ("Cargo.toml", '\u{e7a8}'),
+            ("Dockerfile", '\u{e7b0}'),
+            ("unknown.extension", '\u{f15b}'),
+            ("no-extension", '\u{f15b}'),
+            ("non-utf8-\u{fffd}", '\u{f15b}'),
+        ] {
+            entry.name = name.into();
+            assert_eq!(entry_icon(&entry), icon, "{name}");
+        }
+        entry.flags.set(EntryFlags::EXEC);
+        assert_eq!(entry_icon(&entry), '\u{f489}');
+        entry.name = "executable.py".into();
+        assert_eq!(entry_icon(&entry), '\u{e73c}');
+        entry.flags.set(EntryFlags::DIR_OR_DIRLNK);
+        assert_eq!(entry_icon(&entry), '\u{f07b}');
+        entry.flags.set(EntryFlags::SYMLINK);
+        assert_eq!(entry_icon(&entry), '\u{f481}');
+        entry.flags.set(EntryFlags::SYM_ORPHAN);
+        assert_eq!(entry_icon(&entry), '\u{f481}');
+    }
+
+    #[test]
+    fn nerd_font_icons_render_in_both_views_and_cursor_redraws() {
+        let (mut app, d) = test_app("nerd-font-render");
+        for name in ["main.go", "script.PY"] {
+            std::fs::write(d.join(name), b"").unwrap();
+        }
+        app.reload_dir();
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        for detail in [true, false] {
+            app.detail = detail;
+            app.cfg.ui.nerd_font = true;
+            app.dir.cursor = 0;
+            app.dirty = Dirty::Full;
+            app.render();
+            let frame = out.take();
+            for text in ["\u{e626} main.go", "\u{e73c} script.PY", "\u{f07b} subdir/", "\u{f15b} alpha"] {
+                assert!(frame.contains(text), "detail={detail}: {frame:?}");
+            }
+            // Navigation redraws only the old and new cursor rows.
+            app.dir.move_to_name("main.go");
+            app.dirty = Dirty::TwoLines;
+            app.render();
+            let frame = out.take();
+            assert!(frame.contains("\u{e626} main.go"), "{frame:?}");
+            assert!(!frame.contains("\x1b[1;1H"), "{frame:?}");
+            act(&mut app, Action::Next);
+            app.render();
+            let frame = out.take();
+            assert!(frame.contains("\u{e626} main.go") && frame.contains("\u{e73c} script.PY"), "{frame:?}");
+
+            app.cfg.ui.nerd_font = false;
+            app.dirty = Dirty::Full;
+            app.render();
+            let frame = out.take();
+            assert!(frame.contains("main.go") && frame.contains("script.PY"));
+            assert!(!frame.contains(['\u{e626}', '\u{e73c}', '\u{f07b}', '\u{f15b}']), "{frame:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nerd_font_rows_preserve_selection_styles_and_truncate_by_display_width() {
+        let (mut app, d) = test_app("nerd-font-width");
+        let i = app.dir.entries.iter().position(|e| &*e.name == "alpha").unwrap();
+        app.dir.entries[i].name = "wide-你好-long-filename.py".into();
+        app.dir.entries[i].flags.set(EntryFlags::EXEC);
+        // Select through the path set, without relying on the cached entry flag.
+        app.sel.add(&app.dir.path_at(i).unwrap());
+        for detail in [true, false] {
+            for width in [32, 40, 60] {
+                let line = entry_line(&app.dir, i, width, detail, &app.cfg.theme, &app.sel, true);
+                let text = line.text();
+                assert!(text.starts_with('+') && text.ends_with('*'), "{text:?}");
+                assert!(text.contains("\u{e73c} "), "{text:?}");
+                assert!(crate::ui::str_width(&text) < width, "{width}: {text:?}");
+                let icon = line.spans.iter().find(|s| s.text == "\u{e73c} ").unwrap();
+                assert_eq!(icon.style, app.cfg.theme.exec);
+                assert_eq!(line.spans.last().unwrap().style, app.cfg.theme.exec);
+                if !detail {
+                    assert_eq!(line.spans[0].style, app.cfg.theme.selected);
+                }
+                if detail && width == 32 {
+                    assert!(text.contains('…'), "{text:?}");
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
