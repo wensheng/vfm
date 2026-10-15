@@ -3,8 +3,8 @@
 A small, fast terminal file manager in safe Rust.
 Linux, macOS and Windows.
 
-- **Small:** ~1.2 MB stripped binary; 6 dependencies (crossterm, unicode-width,
-  toml, regex-lite, trash, and libc on Unix).
+- **Small:** ~1.2 MB stripped binary; crossterm, unicode-width, toml, regex-lite,
+  trash, and a platform helper (libc on Unix, crossterm_winapi on Windows).
 - **Fast:** one directory in memory, 40-byte entries, lazy sorting, and a
   two-line redraw for cursor moves. Measured: ~3 ms to load and render a
   2,700-entry dir, ~12 ms for 20,000 entries, 4.4 MB RSS.
@@ -12,7 +12,8 @@ Linux, macOS and Windows.
   atomics only.
 - **Plugins for preview:** any command that prints to stdout (ANSI colors
   supported) can be a previewer. Image and video previews, through
-  [kitim](https://github.com/wensheng/kitim), on terminals with kitty graphics.
+  [kitim](https://github.com/wensheng/kitim), and PDF/EPUB previews through
+  [kitpdf](https://github.com/wensheng/kitpdf), on terminals with kitty graphics.
 
 ## Build
 
@@ -98,6 +99,7 @@ debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
 kitim       = false       # image/video previews via kitim (see "Built-in plugin: kitim")
 kitim_sound = false       # and play videos' sound in those previews
+kitpdf      = false       # PDF/EPUB previews with focused page navigation
 bat         = true        # highlight text previews with bat (or batcat), if installed
 
 [colors]                  # name, 0-255, or 0xRRGGBB
@@ -158,6 +160,8 @@ the same way, as `<run…> PATH WIDTH HEIGHT`, where WIDTH and HEIGHT are the
 pane's body in cells. vfm only uses such a rule if the terminal answered its
 kitty graphics probe at startup, as terminals implementing the protocol do
 (kitty and Ghostty, for example).
+Windows consoles use the same query through VT input, restoring native keyboard
+input afterward; this includes Kitty-capable ConPTY terminals such as Vivida.
 Elsewhere, and inside tmux, the next matching rule or the built-in preview is
 used instead.
 
@@ -170,9 +174,54 @@ sequences, and forces `q=2` and `C=1`, so a previewer can't move the screen or
 make the terminal answer on vfm's input. Plain text that isn't part of a frame
 is shown as the error when no frame arrives.
 
+With `interactive = true` (requires `graphics = true`), stdin stays open.
+While focused, vfm sends newline-terminated `next`, `prev`, `first`, and `last`
+commands. The previewer clamps page boundaries and emits a new frame for each
+page change. Pipe writes run off the UI thread with a bounded queue; excess
+key repeats can be dropped while a previewer is stalled. Closing the pane,
+changing the hovered file, or resizing stops the child and closes its pipes.
+
+### Built-in plugin: kitpdf
+
+Build and install the companion kitpdf checkout with pane support:
+
+```sh
+cargo install --path ../kitpdf
+```
+
+Run that from the vfm checkout, then add this to `config.toml`:
+
+```toml
+[preview]
+kitpdf = true
+```
+
+Press `P` to show the preview, select a PDF or EPUB, and press `l`/Right to
+focus it. `j`/Down, PageDown, Ctrl-f, or Right turn to the next page;
+`k`/Up, PageUp, or Ctrl-b turn back. Home/End jump to the first/last page.
+Esc or `h`/Left returns focus to the file list. The focused header shows the
+page controls. Enter retains its normal open-file action.
+
+The plugin starts at page 1, keeps the document open for page turns, and
+reflows EPUB text for the pane. Resizing or selecting another file starts
+a fresh preview. It requires a terminal that answers vfm's Kitty graphics
+probe; other terminals keep their normal fallback preview. Missing kitpdf
+or unreadable documents show an error in the pane.
+
+The built-in rule is added after custom rules. To use a specific executable,
+configure the equivalent rule instead:
+
+```toml
+[[previewer]]
+match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]
+run = "kitpdf --preview"
+graphics = true
+interactive = true
+```
+
 ### Built-in plugin: kitim
 
-vfm ships one graphics previewer, off by default. Install a
+The image/video graphics previewer is off by default. Install a
 [kitim](https://github.com/wensheng/kitim) that has `--preview`, then enable it
 in `config.toml`:
 

@@ -241,7 +241,7 @@ pub struct App {
     pub screen: Screen,
     pub events: Box<dyn EventSource>,
     pub preview: Preview,
-    /// Keyboard navigation currently scrolls the text preview.
+    /// Keyboard navigation currently scrolls or turns pages in the preview.
     preview_focused: bool,
     /// Offset in wrapped display rows, not source lines.
     preview_scroll: usize,
@@ -1084,16 +1084,14 @@ impl App {
         } else if matches!(self.mode, Mode::Normal)
             && self.preview_pane().is_some()
             && self.preview_pin.is_none()
-            && self.preview.image().is_none()
-            && !self
-                .dir
-                .hovered_name()
-                .and_then(|n| self.match_previewer(n))
-                .is_some_and(|i| self.cfg.previewers[i].graphics)
-            && self
-                .dir
-                .hovered_path()
-                .is_some_and(|p| crate::preview::opens_as_text(&p))
+            && (self.preview.is_interactive()
+                || (self.preview.image().is_none()
+                    && !self
+                        .dir
+                        .hovered_name()
+                        .and_then(|n| self.match_previewer(n))
+                        .is_some_and(|i| self.cfg.previewers[i].graphics)
+                    && self.dir.hovered_path().is_some_and(|p| crate::preview::opens_as_text(&p))))
         {
             self.preview_focused = true;
             self.dirty = Dirty::Full;
@@ -1514,6 +1512,20 @@ impl App {
 
     /// Consume navigation while the preview owns keyboard focus.
     fn apply_preview(&mut self, action: &Action) -> bool {
+        if self.preview.is_interactive() {
+            let command = match action {
+                Action::Next | Action::PgDn | Action::HalfPgDn | Action::NavIn => Some("next\n"),
+                Action::Prev | Action::PgUp | Action::HalfPgUp => Some("prev\n"),
+                Action::Home => Some("first\n"),
+                Action::End => Some("last\n"),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.preview.turn_page(command);
+                self.dirty = Dirty::Full; // Also show a spawn failure during debounce immediately.
+                return true;
+            }
+        }
         let page = self.screen.list_rows();
         let (down, amount) = match action {
             Action::Next => (true, 1),
@@ -1594,7 +1606,7 @@ impl App {
                 if r.graphics {
                     // Exactly the body: an image may fill every cell it's given.
                     pane = (pw - 1, self.screen.list_rows() as u16);
-                    Source::Graphics(argv)
+                    if r.interactive { Source::InteractiveGraphics(argv) } else { Source::Graphics(argv) }
                 } else {
                     Source::Previewer(argv)
                 }
@@ -2130,7 +2142,15 @@ impl App {
         if self.preview_focused {
             meta.spans.insert(
                 0,
-                Span { text: " [FOCUSED: Esc/Left exits] ".into(), style: theme.cursor },
+                Span {
+                    text: if self.preview.is_interactive() {
+                        " [FOCUSED: j/k pages, Esc/Left exits] "
+                    } else {
+                        " [FOCUSED: Esc/Left exits] "
+                    }
+                    .into(),
+                    style: theme.cursor,
+                },
             );
         }
         if let Some((_, truncated)) = self.preview.lines() {
@@ -2409,7 +2429,7 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "vfm — keys",
         "",
         "  j/k or arrows      move            h/Left       parent dir",
-        "  l/Right            enter dir / focus text preview",
+        "  l/Right            enter dir / focus text or document preview",
         "  Enter              open (dir/media/text)",
         "  g / G              top / bottom    C-d / C-u    half page",
         "  J ±n               jump n rows     C-y          newest entry",
@@ -2426,6 +2446,7 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "  f                  file info       P            preview toggle",
         "  ?                  this help",
         "  Focused preview:   Up/Down scroll, PgDn/C-f down, PgUp/C-b up",
+        "  Document preview:  j/k or PgDn/PgUp turn pages, Home/End first/last",
         "                     Esc/Left returns to the file list",
         "",
         "  Space              select + move   m m          range select",
@@ -3085,6 +3106,74 @@ mod tests {
     }
 
     #[test]
+    fn document_preview_focus_sends_page_commands_and_cleans_up() {
+        let (mut app, d) = text_preview_app("document-focus", "\0document");
+        let executable = std::env::current_exe().unwrap();
+        app.cfg.previewers = vec![crate::config::PreviewerRule {
+            patterns: vec!["alpha".into()],
+            cmd: format!(
+                "\"{}\" --exact preview::tests::interactive_child --ignored --nocapture --",
+                executable.display()
+            ),
+            graphics: true,
+            interactive: true,
+        }];
+        app.preview_supersede();
+        assert!(!app.preview.is_interactive(), "must wait for Kitty capability");
+        app.graphics = true;
+        app.preview_supersede();
+        assert!(app.preview.is_interactive());
+        let cursor = app.dir.cursor;
+        let path = app.dir.path.clone();
+        // Focus during debounce, then start the child with the first page command.
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        for (event, id) in [
+            (special(KeyCode::PageDown), 2),
+            (special(KeyCode::PageUp), 3),
+            (special(KeyCode::Home), 4),
+            (special(KeyCode::End), 5),
+            (key('j'), 2),
+            (key('k'), 3),
+            (ckey('f'), 2),
+            (ckey('b'), 3),
+            (special(KeyCode::Right), 2),
+        ] {
+            app.handle_event(event);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.preview.image().and_then(|(_, f)| f.id) != Some(id) && Instant::now() < deadline {
+                app.preview.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(app.preview.image().and_then(|(_, f)| f.id), Some(id));
+            assert_eq!(app.dir.cursor, cursor);
+            assert_eq!(app.dir.path, path);
+            assert!(app.preview_focused);
+        }
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.dirty = Dirty::Full;
+        app.render();
+        assert!(out.take().contains("j/k pages"));
+        app.handle_event(special(KeyCode::Left));
+        assert!(!app.preview_focused);
+        assert!(app.preview.is_interactive());
+        app.handle_event(special(KeyCode::Right));
+        app.handle_event(special(KeyCode::Esc));
+        assert!(!app.preview_focused);
+        app.handle_event(special(KeyCode::Right));
+        app.handle_event(Event::Resize(80, 30));
+        assert!(!app.preview_focused && !app.preview.is_interactive());
+        app.handle_event(Event::Resize(120, 30));
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.apply(Action::TogglePreview);
+        assert!(!app.preview_focused && !app.preview.is_interactive());
+        assert!(app.preview.image().is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn focused_preview_scrolls_wrapped_rows_and_renders_focus_indicator() {
         // Width 120 gives a 59-column pane with 57 columns of text.
         let text: String = (0..40).map(|i| format!("{:057}\n", i)).collect();
@@ -3159,6 +3248,7 @@ mod tests {
             patterns: vec!["*.png".into()],
             cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
             graphics: true,
+            interactive: false,
         }];
         let cfg = Config { previewers, ..Config::default() };
         let out = SharedBuf::default();
@@ -3553,6 +3643,7 @@ mod tests {
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
             graphics: false,
+            interactive: false,
         }];
         let src = TestSource::new();
         let screen = Screen::new(Box::new(Vec::new()), 120, 30);

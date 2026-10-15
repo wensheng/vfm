@@ -17,7 +17,7 @@ use crate::ansi::AnsiFeeder;
 use crate::graphics::{Frame, Splitter};
 use crate::sort::natural_cmp;
 use crate::ui::Line;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
@@ -81,6 +81,7 @@ pub enum PreviewMsg {
 pub struct JobHandle {
     child: Option<Child>,
     pub rx: Receiver<PreviewMsg>,
+    input: Option<SyncSender<&'static str>>,
 }
 
 impl JobHandle {
@@ -93,19 +94,37 @@ impl JobHandle {
         std::thread::Builder::new()
             .name("vfm-preview".into())
             .spawn(move || read_job(stdout, tx, max_bytes))?;
-        Ok(JobHandle { child: Some(child), rx })
+        Ok(JobHandle { child: Some(child), rx, input: None })
     }
 
     /// Run a graphics previewer: stdout is cut into frames (see `graphics`).
-    pub fn spawn_graphics(mut command: Command) -> std::io::Result<JobHandle> {
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    pub fn spawn_graphics(mut command: Command, interactive: bool) -> std::io::Result<JobHandle> {
+        command
+            .stdin(if interactive { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = mpsc::sync_channel(1);
+        // Own the child before spawning threads so errors also kill and reap it.
+        let stdin = child.stdin.take();
+        let mut job = JobHandle { child: Some(child), rx, input: None };
+        if let Some(mut stdin) = stdin {
+            // Bound key repeat while a document is slow; never block the UI on a pipe.
+            let (input, commands) = mpsc::sync_channel::<&'static str>(16);
+            std::thread::Builder::new().name("vfm-preview-input".into()).spawn(move || {
+                while let Ok(command) = commands.recv() {
+                    if stdin.write_all(command.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            })?;
+            job.input = Some(input);
+        }
         std::thread::Builder::new()
             .name("vfm-preview".into())
             .spawn(move || read_graphics(stdout, tx))?;
-        Ok(JobHandle { child: Some(child), rx })
+        Ok(job)
     }
 }
 
@@ -198,6 +217,8 @@ pub enum Source {
     Previewer(Vec<String>),
     /// A `graphics = true` previewer: same argv, but its output is frames.
     Graphics(Vec<String>),
+    /// Graphics with a persistent stdin command pipe for page navigation.
+    InteractiveGraphics(Vec<String>),
     /// A `>` plugin's command line, run through the shell in the current
     /// directory. Never cached: it describes the directory, which changes.
     Shell(String),
@@ -284,6 +305,25 @@ impl Preview {
 
     pub fn is_busy(&self) -> bool {
         matches!(self.state, PreviewState::Running { .. } | PreviewState::Debounce { .. })
+    }
+
+    /// Whether the current preview can receive page commands.
+    pub fn is_interactive(&self) -> bool {
+        matches!(&self.state, PreviewState::Debounce { target, .. } | PreviewState::Running { target, .. }
+            if matches!(target.source, Source::InteractiveGraphics(_)))
+    }
+
+    /// Queue a page command without blocking input while the previewer renders.
+    pub fn turn_page(&mut self, command: &'static str) {
+        // A keypress during debounce should start the child before sending input.
+        if let PreviewState::Debounce { at, .. } = &self.state {
+            self.tick(*at);
+        }
+        if let PreviewState::Running { job, .. } = &self.state {
+            if let Some(input) = &job.input {
+                let _ = input.try_send(command);
+            }
+        }
     }
 
     /// Failed-state error text, if any.
@@ -435,7 +475,8 @@ impl Preview {
 
     /// Transition Debounce → Running (external command) or Done (builtin).
     fn start(&mut self, target: Target) -> Tick {
-        let graphics = matches!(target.source, Source::Graphics(_));
+        let graphics = matches!(target.source, Source::Graphics(_) | Source::InteractiveGraphics(_));
+        let interactive = matches!(target.source, Source::InteractiveGraphics(_));
         let command = match &target.source {
             Source::Builtin => match self.highlighter(&target.path) {
                 Some(command) => command,
@@ -448,7 +489,7 @@ impl Preview {
                     return Tick::Finished;
                 }
             },
-            Source::Previewer(argv) | Source::Graphics(argv) => {
+            Source::Previewer(argv) | Source::Graphics(argv) | Source::InteractiveGraphics(argv) => {
                 let Some((prog, args)) = argv.split_first() else {
                     self.state = PreviewState::Failed { sig: target.sig, err: "empty command".into() };
                     return Tick::Failed;
@@ -465,7 +506,11 @@ impl Preview {
             Source::Shell(line) => crate::plugin::shell_command(line, &self.cwd, &self.env),
         };
         let program = command.get_program().to_string_lossy().into_owned();
-        let job = if graphics { JobHandle::spawn_graphics(command) } else { JobHandle::spawn(command, self.max_bytes) };
+        let job = if graphics {
+            JobHandle::spawn_graphics(command, interactive)
+        } else {
+            JobHandle::spawn(command, self.max_bytes)
+        };
         match job {
             Ok(job) => {
                 self.state = PreviewState::Running { target, job };
@@ -635,6 +680,27 @@ fn sniff_kind(data: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Child process fixture: exercises real pipes on Windows as well as Unix.
+    #[test]
+    #[ignore = "spawned by the interactive preview integration test"]
+    fn interactive_child() {
+        use std::io::BufRead;
+        let mut out = std::io::stdout().lock();
+        write!(out, "\x1b_Ga=T,i=1;AAAA\x1b\\").unwrap();
+        out.flush().unwrap();
+        for command in std::io::stdin().lock().lines() {
+            let id = match command.unwrap().as_str() {
+                "next" => 2,
+                "prev" => 3,
+                "first" => 4,
+                "last" => 5,
+                _ => 6,
+            };
+            write!(out, "\x1b_Ga=T,i={id};AAAA\x1b\\").unwrap();
+            out.flush().unwrap();
+        }
+    }
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("vfm-prev-{name}-{}", std::process::id()));

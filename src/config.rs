@@ -61,6 +61,8 @@ pub struct PreviewCfg {
     pub kitim: bool,
     /// Videos previewed by the kitim plugin play their sound.
     pub kitim_sound: bool,
+    /// PDF and EPUB previews with page navigation through kitpdf.
+    pub kitpdf: bool,
     /// Highlight text previews with bat when it is installed.
     pub bat: bool,
 }
@@ -79,6 +81,8 @@ pub struct PreviewerRule {
     /// Prints kitty graphics frames, not text (see `graphics`). Only tried
     /// when the terminal answered the graphics probe.
     pub graphics: bool,
+    /// Accepts next/prev/first/last lines on stdin while focused.
+    pub interactive: bool,
 }
 
 /// File types kitim previews: what the image crate decodes, plus video
@@ -111,7 +115,17 @@ pub fn kitim_rule(sound: bool) -> PreviewerRule {
         .flat_map(|ext| [format!("*.{ext}"), format!("*.{}", ext.to_uppercase())])
         .collect();
     let cmd = if sound { "kitim --sound --preview" } else { "kitim --preview" };
-    PreviewerRule { patterns, cmd: cmd.into(), graphics: true }
+    PreviewerRule { patterns, cmd: cmd.into(), graphics: true, interactive: false }
+}
+
+/// The built-in PDF/EPUB previewer, enabled with `[preview] kitpdf = true`.
+pub fn kitpdf_rule() -> PreviewerRule {
+    PreviewerRule {
+        patterns: ["*.pdf", "*.PDF", "*.epub", "*.EPUB"].map(String::from).into(),
+        cmd: "kitpdf --preview".into(),
+        graphics: true,
+        interactive: true,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +176,7 @@ impl Default for Config {
                 max_bytes: 256 * 1024,
                 kitim: false,
                 kitim_sound: false,
+                kitpdf: false,
                 bat: true,
             },
             theme: Theme::default(),
@@ -265,6 +280,7 @@ impl Config {
             }
             get_bool(p, "kitim", &mut self.preview.kitim);
             get_bool(p, "kitim_sound", &mut self.preview.kitim_sound);
+            get_bool(p, "kitpdf", &mut self.preview.kitpdf);
             get_bool(p, "bat", &mut self.preview.bat);
         }
         // [[previewer]] rules
@@ -287,12 +303,21 @@ impl Config {
                 }
                 let mut graphics = false;
                 get_bool(tbl, "graphics", &mut graphics);
-                self.previewers.push(PreviewerRule { patterns, cmd, graphics });
+                let mut interactive = false;
+                get_bool(tbl, "interactive", &mut interactive);
+                if interactive && !graphics {
+                    errs.push("interactive previewers require graphics = true".into());
+                    continue;
+                }
+                self.previewers.push(PreviewerRule { patterns, cmd, graphics, interactive });
             }
         }
         // After the user's rules: first match wins, so theirs take precedence.
         if self.preview.kitim {
             self.previewers.push(kitim_rule(self.preview.kitim_sound));
+        }
+        if self.preview.kitpdf {
+            self.previewers.push(kitpdf_rule());
         }
         // [[opener]] definitions
         if let Some(rules) = t.get("opener").and_then(|v| v.as_array()) {
@@ -610,6 +635,32 @@ graphics = true
         let t: toml::Table = "[preview]\nkitim_sound = true\n".parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert!(cfg.previewers.is_empty());
+    }
+
+    #[test]
+    fn kitpdf_plugin_is_opt_in_and_custom_rules_take_precedence() {
+        let mut cfg = Config::default();
+        assert!(!cfg.preview.kitpdf);
+        let t: toml::Table = r#"
+[preview]
+kitpdf = true
+[[previewer]]
+match = ["*.pdf"]
+run = "custom --preview"
+graphics = true
+interactive = true
+"#
+        .parse()
+        .unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert_eq!(cfg.previewers.len(), 2);
+        assert_eq!(cfg.previewers[0].cmd, "custom --preview");
+        let rule = &cfg.previewers[1];
+        assert_eq!(rule.cmd, "kitpdf --preview");
+        assert!(rule.graphics && rule.interactive);
+        assert_eq!(rule.patterns, ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]);
+        let t: toml::Table = "[[previewer]]\nmatch=['*.pdf']\nrun='bad'\ninteractive=true".parse().unwrap();
+        assert!(!Config::default().apply_table(&t).is_empty());
     }
 
     #[test]
