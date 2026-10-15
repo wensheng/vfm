@@ -12,7 +12,7 @@ pub enum Action {
     // navigation
     Back,          // h / Left: parent dir
     Open,          // Enter: enter dir / open file
-    NavIn,         // l / Right: into dir only
+    NavIn,         // l / Right: enter dir or focus text preview
     Next,          // j / Down
     Prev,          // k / Up
     PgDn,
@@ -40,7 +40,7 @@ pub enum Action {
     ToggleHidden, // .
     ToggleDetail, // d
     FileInfo,     // f
-    CycleSort,    // t: name → mtime → size → ext
+    CycleSort,    // s: name → mtime → size → ext
     ReverseSort,  // C-t
     CycleTime,    // T: mtime → atime → crtime
     Redraw,       // C-l
@@ -158,7 +158,7 @@ pub fn default_keymap() -> HashMap<KeyEvent, Action> {
     bind(Char('.'), KeyModifiers::NONE, Action::ToggleHidden);
     bind(Char('d'), KeyModifiers::NONE, Action::ToggleDetail);
     bind(Char('f'), KeyModifiers::NONE, Action::FileInfo);
-    bind(Char('t'), KeyModifiers::NONE, Action::CycleSort);
+    bind(Char('s'), KeyModifiers::NONE, Action::CycleSort);
     bind(Char('t'), c, Action::ReverseSort);
     bind(Char('T'), KeyModifiers::SHIFT, Action::CycleTime);
     bind(Char('l'), c, Action::Redraw);
@@ -236,6 +236,8 @@ mod tests {
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)], Action::Next);
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)], Action::Rename);
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE)], Action::GotoCtx(3));
+        assert_eq!(m[&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)], Action::CycleSort);
+        assert!(!m.contains_key(&KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)));
         // Sanity: every Action variant is reachable from at least one key
         // except the synthetic ones (Click/Resize/Input/Esc/PluginRun).
         assert!(m.len() > 50);

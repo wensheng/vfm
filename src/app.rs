@@ -9,10 +9,12 @@ use crate::context::{Context, CTX_MAX};
 use crate::dir::Dir;
 use crate::entry::{Entry, EntryFlags};
 use crate::filter::{FilterMode, Matcher};
+use crate::graphics;
 use crate::ops::{self, OpHandle, OpKind, OpRequest};
 use crate::plugin::{self, Reply, SpawnMode};
 use crate::preview::{make_sig, Preview, Source, Target, Tick as PreviewTick};
 use crate::selection::Selection;
+use crate::term;
 use crate::ui::{Attrs, Line, Screen, Span, Style, Theme};
 use crate::util::{coolsize, fmt_time, now_secs, tilde_path, truncate_cols};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -81,6 +83,30 @@ pub struct Pin {
     pub plugin: usize,
     /// Pane state to restore on unpin (it may have been opened just for this).
     pub was_enabled: bool,
+}
+
+/// Poll interval while a graphics preview animates: frames are picked up
+/// between polls, so this caps playback near 60 fps. The 30 ms busy poll
+/// would cap it at 33 fps and add judder to 24 and 30 fps video.
+const ANIMATION_TICK: Duration = Duration::from_millis(15);
+
+/// The preview image on screen: which frame, where, and its id for deleting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shown {
+    seq: u64,
+    origin: (u16, u16),
+    id: Option<u32>,
+}
+
+/// What Enter does with a hovered, non-executable file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileOpen {
+    /// Run this command line fullscreen, via `suspend_and_run`.
+    Program(String),
+    /// Open it in `$EDITOR` (vi by default).
+    Edit,
+    /// No handler: Enter does nothing.
+    Nothing,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -215,6 +241,10 @@ pub struct App {
     pub screen: Screen,
     pub events: Box<dyn EventSource>,
     pub preview: Preview,
+    /// Keyboard navigation currently scrolls the text preview.
+    preview_focused: bool,
+    /// Offset in wrapped display rows, not source lines.
+    preview_scroll: usize,
     pub mode: Mode,
     pub input: InputLine,
     /// Statusbar message with 3s expiry.
@@ -232,6 +262,14 @@ pub struct App {
     pub preview_pin: Option<Pin>,
     pub start_dir: PathBuf,
     pub home: Option<PathBuf>,
+    /// Host terminal category; `Other` until the probe (if any) reports.
+    pub term: term::Kind,
+    /// The terminal answered the kitty graphics probe: graphics previewers run.
+    pub graphics: bool,
+    /// Terminal probe in flight: its thread owns tty input until it reports.
+    pub probe: Option<term::Probe>,
+    /// Preview image currently on screen, if any.
+    shown: Option<Shown>,
     keymap: std::collections::HashMap<KeyEvent, Action>,
     last_cursor: usize,
     last_scroll: usize,
@@ -273,6 +311,7 @@ impl App {
             cfg.preview.max_bytes,
         );
         preview.enabled = cfg.ui.preview && cfg.preview.enabled;
+        preview.highlight = crate::preview::bat_argv(cfg.preview.bat, plugin::which);
         let mut app = App {
             detail: cfg.ui.detail,
             ctx_active: 1,
@@ -284,6 +323,8 @@ impl App {
             screen,
             events,
             preview,
+            preview_focused: false,
+            preview_scroll: 0,
             mode: Mode::Normal,
             input: InputLine::default(),
             msg: None,
@@ -296,6 +337,10 @@ impl App {
             preview_pin: None,
             start_dir,
             home,
+            term: term::Kind::Other,
+            graphics: false,
+            probe: None,
+            shown: None,
             keymap,
             last_cursor: 0,
             last_scroll: 0,
@@ -304,16 +349,40 @@ impl App {
         };
         app.apply_ctx_sort_and_filter();
         app.sync_selection_flags();
+        // A pane open at startup previews the first entry without a keypress.
+        app.preview_on_hover();
         Ok(app)
     }
 
     // ------------------------------------------------------------ loop
 
     pub fn run(&mut self) -> Flow {
+        let flow = self.event_loop();
+        // Images outlive vfm's text unless deleted.
+        self.hide_graphics();
+        self.screen.flush();
+        flow
+    }
+
+    fn event_loop(&mut self) -> Flow {
         loop {
             self.render();
             let timeout = self.poll_timeout();
-            match self.events.poll(timeout) {
+            // Until the terminal probe reports, its thread owns tty input:
+            // crossterm would misparse the probe's replies as keystrokes.
+            let polled = match &self.probe {
+                Some(probe) => match probe.wait(timeout) {
+                    Some(report) => {
+                        if let Some(flow) = self.settle_term(report) {
+                            return flow;
+                        }
+                        continue;
+                    }
+                    None => Ok(false),
+                },
+                None => self.events.poll(timeout),
+            };
+            match polled {
                 Ok(true) => match self.events.read() {
                     Ok(ev) => {
                         if let Some(flow) = self.handle_event(ev) {
@@ -332,13 +401,26 @@ impl App {
         }
     }
 
+    /// Records the terminal probe's verdict and replays the keys it swallowed.
+    fn settle_term(&mut self, report: term::Report) -> Option<Flow> {
+        self.probe = None;
+        self.graphics = report.graphics;
+        self.term = self.term.settle(report.graphics);
+        // Graphics previewers were skipped until now; re-pick the hovered one.
+        if self.graphics && self.cfg.previewers.iter().any(|r| r.graphics) {
+            self.preview_supersede();
+        }
+        report.typeahead.into_iter().find_map(|k| self.handle_event(Event::Key(k)))
+    }
+
     /// Adaptive poll interval — the port of nnn's timeout matrix.
     fn poll_timeout(&self) -> Duration {
         if self.pending.is_some() {
             return Duration::ZERO;
         }
         if self.preview.is_busy() {
-            return Duration::from_millis(30);
+            // A running job that has drawn a frame is playing an animation.
+            return if self.preview.image().is_some() { ANIMATION_TICK } else { Duration::from_millis(30) };
         }
         if self.op.is_some() {
             return Duration::from_millis(100);
@@ -353,7 +435,8 @@ impl App {
     fn on_tick(&mut self) -> Option<Flow> {
         // 1. preview debounce → spawn / chunk drain
         let ptick = self.preview.tick(Instant::now());
-        if ptick != PreviewTick::Quiet {
+        // A new frame only swaps the image, which render() does every pass.
+        if !matches!(ptick, PreviewTick::Quiet | PreviewTick::Frame) {
             self.dirty = Dirty::Full;
         }
         // 2. op progress
@@ -425,6 +508,13 @@ impl App {
         if k.code == KeyCode::Esc {
             return Action::Esc;
         }
+        if self.preview_focused && matches!(self.mode, Mode::Normal) && ctrl {
+            match k.code {
+                KeyCode::Char('f' | 'F') => return Action::PgDn,
+                KeyCode::Char('b' | 'B') => return Action::PgUp,
+                _ => {}
+            }
+        }
         match self.mode {
             Mode::Confirm(_) => {
                 return match k.code {
@@ -485,6 +575,13 @@ impl App {
 
     fn apply_normal(&mut self, action: Action) -> Option<Flow> {
         self.dirty = Dirty::None;
+        if self.preview_focused {
+            if self.apply_preview(&action) {
+                return None;
+            }
+            self.preview_focused = false;
+            self.dirty = Dirty::Full;
+        }
         let rows = self.screen.list_rows() as isize;
         match action {
             Action::Next => self.move_cursor(1),
@@ -984,26 +1081,76 @@ impl App {
             if let Some(p) = self.dir.hovered_path() {
                 self.cd(&p);
             }
+        } else if matches!(self.mode, Mode::Normal)
+            && self.preview_pane().is_some()
+            && self.preview_pin.is_none()
+            && self.preview.image().is_none()
+            && !self
+                .dir
+                .hovered_name()
+                .and_then(|n| self.match_previewer(n))
+                .is_some_and(|i| self.cfg.previewers[i].graphics)
+            && self
+                .dir
+                .hovered_path()
+                .is_some_and(|p| crate::preview::opens_as_text(&p))
+        {
+            self.preview_focused = true;
+            self.dirty = Dirty::Full;
         }
     }
 
     fn open_hovered(&mut self) -> Option<Flow> {
-        let (path, is_dir, is_exec) = {
+        let (path, name, is_dir, is_exec) = {
             let e = self.dir.entries.get(self.dir.cursor)?;
-            (self.dir.path_at(self.dir.cursor)?, e.is_dir(), e.flags.has(EntryFlags::EXEC))
+            (self.dir.path_at(self.dir.cursor)?, e.name.clone(), e.is_dir(), e.flags.has(EntryFlags::EXEC))
         };
         if is_dir {
             self.cd(&path);
             return None;
         }
-        // Files: executables run in-place; everything else opens in $EDITOR.
+        // Files: executables run in-place; the rest is `file_open`'s call.
         if is_exec {
-            let name = file_name_of(&path);
-            self.suspend_and_run(&format!("./{}", shquote(&name)), vec![]);
+            let file = file_name_of(&path);
+            self.suspend_and_run(&format!("./{}", shquote(&file)), vec![]);
             return None;
         }
-        self.external_edit();
+        match self.file_open(&path, &name, plugin::which("kitim")) {
+            FileOpen::Program(cmdline) => self.suspend_and_run(&cmdline, vec![]),
+            FileOpen::Edit => self.external_edit(),
+            FileOpen::Nothing => {}
+        }
         None
+    }
+
+    /// What Enter does with a hovered file.
+    ///
+    /// A matching `[[opener]]` rule runs fullscreen, first match winning.
+    /// Otherwise kitim plays images, video and audio — `kitim_installed` is
+    /// passed in so tests decide it — but only on a terminal that answered
+    /// the graphics probe, since kitim would show nothing without it. What's
+    /// left opens in the editor if its head reads as text, else nothing: no
+    /// more vi over binary bytes.
+    fn file_open(&self, path: &Path, name: &str, kitim_installed: bool) -> FileOpen {
+        if let Some(rule) = self
+            .cfg
+            .openers
+            .iter()
+            .find(|r| r.patterns.iter().any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes())))
+        {
+            return FileOpen::Program(format!("{} {}", rule.cmd.trim(), shquote(&file_name_of(path))));
+        }
+        if self.graphics && kitim_installed && crate::config::is_kitim_media(name) {
+            // --fullscreen: images fill the screen and wait for a key, so
+            // the viewer doesn't flash and vanish.
+            let file = shquote(&file_name_of(path));
+            return FileOpen::Program(format!("kitim --fullscreen {file}"));
+        }
+        if crate::preview::opens_as_text(path) {
+            FileOpen::Edit
+        } else {
+            FileOpen::Nothing
+        }
     }
 
     /// Suspend the TUI, run a command line in the current dir, resume.
@@ -1016,6 +1163,11 @@ impl App {
         });
         let mut env = plugin::child_env(&dir, hovered.as_deref(), sel_file.as_deref(), self.ctx_i as u8);
         env.extend(extra_env);
+        // Re-entering the alternate screen wipes images; render() re-sends.
+        self.hide_graphics();
+        // Stop the previewer meanwhile: a video would keep playing its sound.
+        self.preview.disable();
+        self.screen.flush();
         self.screen.leave();
         let res = plugin::run_fullscreen(cmdline, &dir, &env);
         let _ = self.screen.enter();
@@ -1023,6 +1175,8 @@ impl App {
         // The child may have changed the directory contents.
         if self.dir.changed() {
             self.reload_dir();
+        } else {
+            self.preview_on_hover();
         }
         match res {
             Ok(()) => {}
@@ -1358,6 +1512,45 @@ impl App {
 
     // ---- preview plumbing
 
+    /// Consume navigation while the preview owns keyboard focus.
+    fn apply_preview(&mut self, action: &Action) -> bool {
+        let page = self.screen.list_rows();
+        let (down, amount) = match action {
+            Action::Next => (true, 1),
+            Action::Prev => (false, 1),
+            Action::PgDn => (true, page),
+            Action::PgUp => (false, page),
+            Action::HalfPgDn => (true, page / 2),
+            Action::HalfPgUp => (false, page / 2),
+            Action::Home => (false, usize::MAX),
+            Action::End => (true, usize::MAX),
+            Action::Esc | Action::Back => {
+                self.preview_focused = false;
+                self.dirty = Dirty::Full;
+                return true;
+            }
+            Action::NavIn | Action::Resize => return true,
+            _ => return false,
+        };
+        let Some((width, _)) = self.preview_pane() else {
+            return false;
+        };
+        let total = self.preview.lines().map_or(0, |(lines, _)| {
+            lines
+                .iter()
+                .map(|line| wrap_line(line, usize::from(width).saturating_sub(2)).len())
+                .sum::<usize>()
+        });
+        self.preview_scroll = if down {
+            self.preview_scroll.saturating_add(amount)
+        } else {
+            self.preview_scroll.saturating_sub(amount)
+        }
+        .min(total.saturating_sub(page));
+        self.dirty = Dirty::Full;
+        true
+    }
+
     fn preview_supersede(&mut self) {
         // Dir contents changed: the old sig can't match anymore — restart.
         if self.preview.enabled {
@@ -1377,6 +1570,8 @@ impl App {
     }
 
     fn preview_on_hover(&mut self) {
+        self.preview_focused = false;
+        self.preview_scroll = 0;
         if !self.preview.enabled {
             return;
         }
@@ -1392,14 +1587,20 @@ impl App {
         let Some(path) = self.dir.hovered_path() else { return };
         let rule = self.match_previewer(&e.name);
         let sig = make_sig(&path, e.size, e.mtime, (pw, self.screen.h), rule.unwrap_or(usize::MAX));
-        let source = match rule {
-            Some(i) => {
-                let c = &self.cfg.previewers[i].cmd;
-                Source::Previewer(crate::util::shlex(c).unwrap_or_else(|| vec![c.clone()]))
+        let mut pane = (pw, self.screen.h);
+        let source = match rule.map(|i| &self.cfg.previewers[i]) {
+            Some(r) => {
+                let argv = crate::util::shlex(&r.cmd).unwrap_or_else(|| vec![r.cmd.clone()]);
+                if r.graphics {
+                    // Exactly the body: an image may fill every cell it's given.
+                    pane = (pw - 1, self.screen.list_rows() as u16);
+                    Source::Graphics(argv)
+                } else {
+                    Source::Previewer(argv)
+                }
             }
             None => Source::Builtin,
         };
-        let pane = (pw, self.screen.h);
         let env = plugin::child_env(
             &self.dir.path,
             Some(&path),
@@ -1450,11 +1651,13 @@ impl App {
         self.dirty = Dirty::Full;
     }
 
+    /// First rule matching `name`; graphics rules only if the terminal can.
     fn match_previewer(&self, name: &str) -> Option<usize> {
         self.cfg.previewers.iter().position(|r| {
-            r.patterns
-                .iter()
-                .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
+            (self.graphics || !r.graphics)
+                && r.patterns
+                    .iter()
+                    .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
         })
     }
 
@@ -1609,18 +1812,64 @@ impl App {
             self.finish_op(res);
             self.dirty = Dirty::Full;
         }
-        if self.dirty == Dirty::None {
-            return;
-        }
         if self.dirty == Dirty::TwoLines && self.fast_two_lines_ok() {
             self.fast_two_lines();
-            self.dirty = Dirty::None;
-            self.screen.flush();
-            return;
+        } else if self.dirty != Dirty::None {
+            self.render_full();
         }
         self.dirty = Dirty::None;
-        self.render_full();
+        // After the text, so the image goes over a freshly cleared pane.
+        self.sync_graphics();
         self.screen.flush();
+    }
+
+    /// Top-left cell of the pane body while an image may show there: the
+    /// pane is open and no overlay (menu, pager) covers it.
+    fn graphics_origin(&self) -> Option<(u16, u16)> {
+        let (pane_w, _) = self.preview_pane()?;
+        if matches!(self.mode, Mode::Menu(_) | Mode::Pager { .. }) {
+            return None;
+        }
+        Some((2, self.screen.w - pane_w + 1))
+    }
+
+    /// Puts the preview's image on screen, or takes it off, to match the pane.
+    ///
+    /// Images sit above the text and survive text redraws, so output is only
+    /// needed when the wanted frame changes. A new frame goes up before the
+    /// old one is deleted, so animations don't flicker; terminals draw the
+    /// newer image id on top. A frame without an id can't be deleted alone,
+    /// so every image is cleared before it goes up.
+    fn sync_graphics(&mut self) {
+        let origin = self.graphics_origin();
+        let frame = origin.and(self.preview.image());
+        let old = self.shown;
+        if old.map(|s| (s.seq, Some(s.origin))) == frame.map(|(seq, _)| (seq, origin)) {
+            return;
+        }
+        let buf = &mut self.screen.buf;
+        let (Some(origin), Some((seq, frame))) = (origin, frame) else {
+            if let Some(old) = self.shown.take() {
+                graphics::delete(buf, old.id);
+            }
+            return;
+        };
+        if old.is_some() && frame.id.is_none() {
+            graphics::delete(buf, None);
+        }
+        self.screen.move_to(origin.0, origin.1);
+        self.screen.buf.extend_from_slice(&frame.bytes);
+        if let Some(old_id) = old.and_then(|s| s.id).filter(|&id| Some(id) != frame.id) {
+            graphics::delete(&mut self.screen.buf, Some(old_id));
+        }
+        self.shown = Some(Shown { seq, origin, id: frame.id });
+    }
+
+    /// Takes the preview image off screen (output is queued, not flushed).
+    fn hide_graphics(&mut self) {
+        if let Some(old) = self.shown.take() {
+            graphics::delete(&mut self.screen.buf, old.id);
+        }
     }
 
     /// The fast path applies only when the scroll window stays put. Scroll is
@@ -1645,7 +1894,7 @@ impl App {
             {
                 old = Some((self.last_cursor, entry_line(
                     &self.dir, self.last_cursor, w, detail, &theme,
-                    &self.sel, self.dir.path_at(self.last_cursor),
+                    &self.sel, self.cfg.ui.nerd_font,
                 )));
             }
             if self.dir.cursor >= self.dir.scroll
@@ -1654,7 +1903,7 @@ impl App {
             {
                 new = Some((self.dir.cursor, entry_line(
                     &self.dir, self.dir.cursor, w, detail, &theme,
-                    &self.sel, self.dir.path_at(self.dir.cursor),
+                    &self.sel, self.cfg.ui.nerd_font,
                 )));
             }
         }
@@ -1705,7 +1954,7 @@ impl App {
         let end = (scroll + rows).min(self.dir.nvisible());
         let mut row = 2u16;
         for i in scroll..end {
-            let line = entry_line(&self.dir, i, pw, self.detail, &theme, &self.sel, self.dir.path_at(i));
+            let line = entry_line(&self.dir, i, pw, self.detail, &theme, &self.sel, self.cfg.ui.nerd_font);
             let pad = if i == self.dir.cursor { theme.cursor } else { Style::default() };
             self.screen.put_line(row, &line, pw, pad);
             row += 1;
@@ -1755,7 +2004,7 @@ impl App {
             let name = tilde_path(path, self.home.as_deref());
             let short = truncate_cols(&name, 28).0;
             let style = if i == self.ctx_i { theme.ctx_active } else { theme.ctx_inactive };
-            spans.push(Span { text: format!("{}:{} ", i + 1, short), style });
+            spans.push(Span { text: format!("{short} "), style });
         }
         let line = Line::from_spans(spans);
         self.screen.put_line(0, &line, self.screen.w as usize, Style::default());
@@ -1856,18 +2105,21 @@ impl App {
         let theme = self.cfg.theme.clone();
         let h = self.screen.h;
         let x = (self.screen.w as usize).saturating_sub(pane_w);
+        let focus_style = if self.preview_focused { theme.cursor } else { theme.divider };
         // Divider.
         for r in 1..h.saturating_sub(1) {
-            self.screen.put_text(r, x.saturating_sub(1) as u16, "│", theme.divider, 1);
+            self.screen.put_text(r, x.saturating_sub(1) as u16, "│", focus_style, 1);
         }
         // Header: hovered name (or the pinned plugin and its dir) + state.
         let name = match self.preview_pin.and_then(|p| self.cfg.plugins.get(p.plugin)) {
             Some(def) => format!("{}: {}", def.name, tilde_path(&self.dir.path, self.home.as_deref())),
             None => self.dir.hovered_name().unwrap_or("").to_string(),
         };
+        let image = self.preview.image().map(|(seq, _)| seq);
         let state = match (&self.preview.state, self.preview.error()) {
             (_, Some(e)) => format!("error: {e}"),
-            (crate::preview::PreviewState::Running { .. }, _) => "…".into(),
+            // A running job with a frame up is playing, not loading.
+            (crate::preview::PreviewState::Running { .. }, _) if image.is_none() => "…".into(),
             (crate::preview::PreviewState::Debounce { .. }, _) => "…".into(),
             _ => String::new(),
         };
@@ -1875,6 +2127,12 @@ impl App {
             Span { text: format!(" {name} "), style: theme.preview_meta },
             Span { text: state, style: theme.preview_meta },
         ]);
+        if self.preview_focused {
+            meta.spans.insert(
+                0,
+                Span { text: " [FOCUSED: Esc/Left exits] ".into(), style: theme.cursor },
+            );
+        }
         if let Some((_, truncated)) = self.preview.lines() {
             if truncated {
                 meta.spans.push(Span { text: " (truncated)".into(), style: theme.preview_meta });
@@ -1882,23 +2140,23 @@ impl App {
         }
         self.screen.put_line_at(1, x as u16, &meta, pane_w, theme.preview_meta);
 
-        // Body.
+        // Body. Leave it alone under an image that is up: on terminals that
+        // attach images to cells, writing those cells erases the image.
+        if image.is_some() && image == self.shown.map(|s| s.seq) {
+            return;
+        }
         let rows = self.screen.list_rows();
         let mut r = 2u16;
         if let Some((lines, _trunc)) = self.preview.lines() {
-            // Head of the output, like a pager: a file preview starts at line 1.
-            for line in lines {
+            let visible = lines
+                .iter()
+                .flat_map(|line| wrap_line(line, pane_w.saturating_sub(2)))
+                .skip(self.preview_scroll)
+                .take(rows);
+            for seg in visible {
                 // One column of padding after the divider.
-                for seg in wrap_line(line, pane_w.saturating_sub(2)) {
-                    self.screen.put_line_at(r, x as u16 + 1, &seg, pane_w - 1, Style::default());
-                    r += 1;
-                    if r as usize >= 2 + rows {
-                        break;
-                    }
-                }
-                if r as usize >= 2 + rows {
-                    break;
-                }
+                self.screen.put_line_at(r, x as u16 + 1, &seg, pane_w - 1, Style::default());
+                r += 1;
             }
         }
         let blank = Line::default();
@@ -1947,7 +2205,7 @@ pub fn shquote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// One listing row: `ind name` (light) or `perm date size name` (detail).
+/// One listing row, with an optional Nerd Font icon before the name.
 fn entry_line(
     dir: &Dir,
     i: usize,
@@ -1955,15 +2213,14 @@ fn entry_line(
     detail: bool,
     theme: &Theme,
     sel: &Selection,
-    path: Option<PathBuf>,
+    nerd_font: bool,
 ) -> Line {
     let Some(e) = dir.entries.get(i) else { return Line::default() };
-    let selected = path.as_deref().map(|p| sel.contains(p)).unwrap_or(false)
-        || e.is_selected();
+    let selected = dir.path_at(i).as_deref().map(|p| sel.contains(p)).unwrap_or(false) || e.is_selected();
     let ind = if selected { "+" } else { " " };
     let ind_style = if selected { theme.selected } else { Style::default() };
     let style = entry_style(e, theme);
-    let mut spans = Vec::with_capacity(5);
+    let mut spans = Vec::with_capacity(if nerd_font { 6 } else { 5 });
     if detail {
         spans.push(Span {
             text: format!("{ind}{:03o} ", e.mode & 0o777),
@@ -1979,6 +2236,9 @@ fn entry_line(
         });
     } else {
         spans.push(Span { text: format!("{ind} "), style: ind_style });
+    }
+    if nerd_font {
+        spans.push(Span { text: format!("{} ", entry_icon(e)), style });
     }
     let used = spans.iter().map(|s| crate::ui::str_width(&s.text)).sum::<usize>();
     let avail = width.saturating_sub(used + 2);
@@ -2006,6 +2266,57 @@ fn entry_style(e: &Entry, theme: &Theme) -> Style {
         theme.hardlink
     } else {
         Style::default()
+    }
+}
+
+/// Picks a Nerd Font glyph from the entry type, filename, or extension.
+fn entry_icon(e: &Entry) -> char {
+    // Nerd Fonts' Font Awesome, Octicons, Seti, and Devicons codepoints.
+    // Links keep their own icon, including links to directories.
+    if e.is_symlink() {
+        return '\u{f481}'; // nf-oct-file_symlink_file
+    }
+    if e.is_dir() {
+        return '\u{f07b}'; // nf-fa-folder
+    }
+    match &*e.name {
+        "Cargo.toml" | "Cargo.lock" => return '\u{e7a8}',
+        "go.mod" | "go.sum" => return '\u{e626}',
+        "Dockerfile" | "Containerfile" => return '\u{e7b0}',
+        "Makefile" | "GNUmakefile" | "CMakeLists.txt" => return '\u{e615}',
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return '\u{e702}',
+        _ => {}
+    }
+    // Compare extensions in ASCII without changing the displayed filename.
+    let ext = e.ext().to_ascii_lowercase();
+    match ext.as_str() {
+        "go" => '\u{e626}',
+        "py" | "pyw" | "pyi" | "pyc" | "ipynb" => '\u{e73c}',
+        "rs" => '\u{e7a8}',
+        "js" | "mjs" | "cjs" | "jsx" => '\u{e74e}',
+        "ts" | "mts" | "cts" | "tsx" => '\u{e628}',
+        "c" | "h" => '\u{e61e}',
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => '\u{e61d}',
+        "cs" => '\u{e648}',
+        "java" | "class" | "jar" => '\u{e738}',
+        "rb" => '\u{e739}',
+        "php" => '\u{e73d}',
+        "lua" => '\u{e620}',
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => '\u{f489}',
+        "html" | "htm" => '\u{e736}',
+        "css" | "scss" | "sass" | "less" => '\u{e749}',
+        "json" | "jsonc" => '\u{e60b}',
+        "toml" | "yaml" | "yml" | "ini" | "conf" | "cfg" => '\u{e615}',
+        "md" | "markdown" => '\u{e73e}',
+        "txt" | "log" | "csv" | "tsv" => '\u{f15c}',
+        "pdf" => '\u{f1c1}',
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" | "tif" | "tiff" => '\u{f1c5}',
+        "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" => '\u{f1c7}',
+        "mp4" | "mkv" | "mov" | "webm" | "avi" | "m4v" => '\u{f1c8}',
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" => '\u{f1c6}',
+        "db" | "sqlite" | "sqlite3" | "sql" => '\u{f1c0}',
+        _ if e.flags.has(EntryFlags::EXEC) => '\u{f489}',
+        _ => '\u{f15b}', // nf-fa-file: unknown, extensionless, or non-UTF-8 names
     }
 }
 
@@ -2098,7 +2409,8 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "vfm — keys",
         "",
         "  j/k or arrows      move            h/Left       parent dir",
-        "  l/Right            enter dir       Enter        open (dir/file)",
+        "  l/Right            enter dir / focus text preview",
+        "  Enter              open (dir/media/text)",
         "  g / G              top / bottom    C-d / C-u    half page",
         "  J ±n               jump n rows     C-y          newest entry",
         "  '                  first file",
@@ -2109,10 +2421,12 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "  C-g                quit + write cd path ($VFM_CD_FILE)",
         "",
         "  /                  filter (Enter keeps, Esc clears, C-n mode)",
-        "  t / C-t            sort key / reverse      T  time type",
+        "  s / C-t            sort key / reverse      T  time type",
         "  .                  show hidden     d            detail toggle",
         "  f                  file info       P            preview toggle",
         "  ?                  this help",
+        "  Focused preview:   Up/Down scroll, PgDn/C-f down, PgUp/C-b up",
+        "                     Esc/Left returns to the file list",
         "",
         "  Space              select + move   m m          range select",
         "  a / A              select all / invert    E     edit selection",
@@ -2215,6 +2529,7 @@ mod tests {
         let mut app = App::new(Config::default(), d.clone(), screen, Box::new(src)).unwrap();
         // Never touch the real ~/.config/vfm/selection from tests.
         app.sel.file = std::env::temp_dir().join(format!("vfm-sel-{name}-{}", std::process::id()));
+        app.preview.highlight = None; // the same output whether or not bat is installed
         (app, d)
     }
 
@@ -2229,13 +2544,13 @@ mod tests {
         std::fs::write(d.join("keep.txt"), b"k").unwrap();
         let src = TestSource::new();
         // n → New prompt; the typed text must NOT trigger bound actions
-        // (x = trash, d = detail, . = hidden, t = sort).
+        // (x = trash, d = detail, . = hidden, s = sort, t = tree).
         src.push(key('n'));
-        for c in "xd.t".chars() {
+        for c in "xd.st".chars() {
             src.push(key(c));
         }
         src.push(special(KeyCode::Backspace));
-        src.push(special(KeyCode::Enter)); // creates "xd."
+        src.push(special(KeyCode::Enter)); // creates "xd.s"
         // / filter: 'k' matches keep.txt only; Enter keeps it.
         src.push(key('/'));
         src.push(key('k'));
@@ -2248,12 +2563,44 @@ mod tests {
         app.sel.file = d.join(".sel");
         let flow = app.run();
         assert_eq!(flow, Flow::Quit(0)); // trailing C-q
-        assert!(d.join("xd.").is_file(), "prompt text was hijacked by keybindings");
+        assert!(d.join("xd.s").is_file(), "prompt text was hijacked by keybindings");
         assert!(app.detail, "'d' typed into the prompt toggled detail mode");
         assert_eq!(app.ctx[0].filter_text.as_deref(), Some("k"));
         assert_eq!(app.dir.nvisible(), 1);
         assert!(d.join("keep.txt").exists(), "trash ran without confirmation");
         assert!(matches!(app.mode, Mode::Normal));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The probe owns tty input: the run loop reads no events until its
+    /// report lands, then replays the swallowed keys before live input.
+    #[test]
+    fn terminal_probe_gates_input_and_replays_typeahead() {
+        let d = tmpdir("probe");
+        for n in ["alpha", "beta", "gamma"] {
+            std::fs::write(d.join(n), b"").unwrap();
+        }
+        let src = TestSource::new();
+        // Replayed G (bottom: gamma) then live k (up: beta). Live k first
+        // would wrap alpha → gamma and G would stay there.
+        src.push(key('k'));
+        let screen = Screen::new(Box::new(io::sink()), 100, 30);
+        let mut app = App::new(Config::default(), d.clone(), screen, Box::new(src)).unwrap();
+        app.sel.file = d.join(".sel");
+        let (tx, probe) = term::Probe::channel();
+        app.probe = Some(probe);
+        // Report late, so a loop ignoring the gate reads k and the trailing
+        // C-q before the report exists.
+        let reporter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let typeahead = vec![KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)];
+            tx.send(term::Report { graphics: true, typeahead }).unwrap();
+        });
+        assert_eq!(app.run(), Flow::Quit(0)); // trailing C-q
+        reporter.join().unwrap();
+        assert_eq!(app.term, term::Kind::KittyGraphics);
+        assert!(app.graphics && app.probe.is_none());
+        assert_eq!(app.dir.hovered_name(), Some("beta"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2407,7 +2754,11 @@ mod tests {
         app.render();
         let frame = out.take();
         assert!(frame.contains("alpha"), "frame: {frame}");
-        assert!(frame.contains(&*d.to_string_lossy()));
+        let shown = tilde_path(&app.dir.path, app.home.as_deref());
+        assert!(frame.contains(&shown));
+        assert!(!frame.contains(&format!("1:{}", truncate_cols(&shown, 28).0)));
+        #[cfg(windows)]
+        assert!(!frame.contains(r"\\?\"), "verbatim prefix leaked into headers: {frame}");
         // Cursor row is reversed (SGR 7) and bold (1).
         assert!(frame.contains("\x1b[0;1;7m"), "cursor style missing: {frame}");
         // Detail view (the default) shows octal perms + size; light mode doesn't.
@@ -2419,6 +2770,107 @@ mod tests {
         app.render();
         let frame = out.take();
         assert!(frame.contains("alpha") && !frame.contains(&perms), "light mode: {frame}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nerd_font_icons_follow_file_types_and_keep_directory_and_link_identity() {
+        let mut entry = Entry { name: "main.go".into(), size: 0, mtime: 0, mode: 0, flags: EntryFlags::default() };
+        for (name, icon) in [
+            ("main.go", '\u{e626}'),
+            ("main.GO", '\u{e626}'),
+            ("script.py", '\u{e73c}'),
+            ("script.PY", '\u{e73c}'),
+            ("types.pyi", '\u{e73c}'),
+            ("go.mod", '\u{e626}'),
+            ("Cargo.toml", '\u{e7a8}'),
+            ("Dockerfile", '\u{e7b0}'),
+            ("unknown.extension", '\u{f15b}'),
+            ("no-extension", '\u{f15b}'),
+            ("non-utf8-\u{fffd}", '\u{f15b}'),
+        ] {
+            entry.name = name.into();
+            assert_eq!(entry_icon(&entry), icon, "{name}");
+        }
+        entry.flags.set(EntryFlags::EXEC);
+        assert_eq!(entry_icon(&entry), '\u{f489}');
+        entry.name = "executable.py".into();
+        assert_eq!(entry_icon(&entry), '\u{e73c}');
+        entry.flags.set(EntryFlags::DIR_OR_DIRLNK);
+        assert_eq!(entry_icon(&entry), '\u{f07b}');
+        entry.flags.set(EntryFlags::SYMLINK);
+        assert_eq!(entry_icon(&entry), '\u{f481}');
+        entry.flags.set(EntryFlags::SYM_ORPHAN);
+        assert_eq!(entry_icon(&entry), '\u{f481}');
+    }
+
+    #[test]
+    fn nerd_font_icons_render_in_both_views_and_cursor_redraws() {
+        let (mut app, d) = test_app("nerd-font-render");
+        for name in ["main.go", "script.PY"] {
+            std::fs::write(d.join(name), b"").unwrap();
+        }
+        app.reload_dir();
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        for detail in [true, false] {
+            app.detail = detail;
+            app.cfg.ui.nerd_font = true;
+            app.dir.cursor = 0;
+            app.dirty = Dirty::Full;
+            app.render();
+            let frame = out.take();
+            for text in ["\u{e626} main.go", "\u{e73c} script.PY", "\u{f07b} subdir/", "\u{f15b} alpha"] {
+                assert!(frame.contains(text), "detail={detail}: {frame:?}");
+            }
+            // Navigation redraws only the old and new cursor rows.
+            app.dir.move_to_name("main.go");
+            app.dirty = Dirty::TwoLines;
+            app.render();
+            let frame = out.take();
+            assert!(frame.contains("\u{e626} main.go"), "{frame:?}");
+            assert!(!frame.contains("\x1b[1;1H"), "{frame:?}");
+            act(&mut app, Action::Next);
+            app.render();
+            let frame = out.take();
+            assert!(frame.contains("\u{e626} main.go") && frame.contains("\u{e73c} script.PY"), "{frame:?}");
+
+            app.cfg.ui.nerd_font = false;
+            app.dirty = Dirty::Full;
+            app.render();
+            let frame = out.take();
+            assert!(frame.contains("main.go") && frame.contains("script.PY"));
+            assert!(!frame.contains(['\u{e626}', '\u{e73c}', '\u{f07b}', '\u{f15b}']), "{frame:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nerd_font_rows_preserve_selection_styles_and_truncate_by_display_width() {
+        let (mut app, d) = test_app("nerd-font-width");
+        let i = app.dir.entries.iter().position(|e| &*e.name == "alpha").unwrap();
+        app.dir.entries[i].name = "wide-你好-long-filename.py".into();
+        app.dir.entries[i].flags.set(EntryFlags::EXEC);
+        // Select through the path set, without relying on the cached entry flag.
+        app.sel.add(&app.dir.path_at(i).unwrap());
+        for detail in [true, false] {
+            for width in [32, 40, 60] {
+                let line = entry_line(&app.dir, i, width, detail, &app.cfg.theme, &app.sel, true);
+                let text = line.text();
+                assert!(text.starts_with('+') && text.ends_with('*'), "{text:?}");
+                assert!(text.contains("\u{e73c} "), "{text:?}");
+                assert!(crate::ui::str_width(&text) < width, "{width}: {text:?}");
+                let icon = line.spans.iter().find(|s| s.text == "\u{e73c} ").unwrap();
+                assert_eq!(icon.style, app.cfg.theme.exec);
+                assert_eq!(line.spans.last().unwrap().style, app.cfg.theme.exec);
+                if !detail {
+                    assert_eq!(line.spans[0].style, app.cfg.theme.selected);
+                }
+                if detail && width == 32 {
+                    assert!(text.contains('…'), "{text:?}");
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2565,7 +3017,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn drive_preview(app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.preview.is_busy() && Instant::now() < deadline {
@@ -2574,9 +3025,260 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn preview_texts(app: &App) -> Vec<String> {
         app.preview.lines().map(|(l, _)| l.iter().map(|l| l.text()).collect()).unwrap_or_default()
+    }
+
+    fn text_preview_app(name: &str, text: &str) -> (App, PathBuf) {
+        let (mut app, d) = test_app(name);
+        std::fs::write(d.join("alpha"), text).unwrap();
+        let index = app.dir.entries.iter().position(|e| &*e.name == "alpha").unwrap();
+        app.set_cursor(index);
+        app.preview.debounce = Duration::ZERO;
+        app.apply(Action::TogglePreview);
+        drive_preview(&mut app);
+        (app, d)
+    }
+
+    #[test]
+    fn focused_preview_routes_scroll_keys_and_returns_to_file_navigation() {
+        let text: String = (0..100).map(|i| format!("row {i:03}\n")).collect();
+        let (mut app, d) = text_preview_app("preview-focus-keys", &text);
+        let cursor = app.dir.cursor;
+        let path = app.dir.path.clone();
+        let page = app.screen.list_rows();
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        for (event, offset) in [
+            (special(KeyCode::Down), 1),
+            (special(KeyCode::Up), 0),
+            (special(KeyCode::PageDown), page),
+            (ckey('f'), page * 2),
+            (special(KeyCode::PageUp), page),
+            (ckey('b'), 0),
+            (special(KeyCode::Up), 0),
+        ] {
+            app.handle_event(event);
+            assert_eq!(app.preview_scroll, offset);
+            assert_eq!(app.dir.cursor, cursor);
+            assert_eq!(app.dir.path, path);
+        }
+        // Esc only releases focus, preserving an accepted filter/range.
+        app.ctx[app.ctx_i].filter_text = Some("a".into());
+        app.sel.range_anchor = Some(cursor);
+        for exit in [KeyCode::Esc, KeyCode::Left] {
+            app.handle_event(special(KeyCode::Right));
+            app.handle_event(special(KeyCode::PageDown));
+            app.handle_event(special(exit));
+            assert!(!app.preview_focused);
+            assert_eq!(app.dir.path, path);
+            assert_eq!(app.ctx[app.ctx_i].filter_text.as_deref(), Some("a"));
+            assert_eq!(app.sel.range_anchor, Some(cursor));
+            app.handle_event(special(KeyCode::Down));
+            assert_eq!(app.dir.cursor, cursor + 1);
+            assert_eq!(app.preview_scroll, 0);
+            app.handle_event(special(KeyCode::Up));
+            assert_eq!(app.dir.cursor, cursor);
+            drive_preview(&mut app);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn focused_preview_scrolls_wrapped_rows_and_renders_focus_indicator() {
+        // Width 120 gives a 59-column pane with 57 columns of text.
+        let text: String = (0..40).map(|i| format!("{:057}\n", i)).collect();
+        let text = format!("{}{}\n{text}", "A".repeat(57), "B".repeat(57));
+        let (mut app, d) = text_preview_app("preview-focus-render", &text);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.handle_event(special(KeyCode::Right));
+        app.render();
+        let frame = out.take();
+        assert!(frame.contains("[FOCUSED: Esc/Left exits]"));
+        assert!(frame.contains(&"A".repeat(57)));
+        app.handle_event(special(KeyCode::Down));
+        app.render();
+        let frame = out.take();
+        assert!(!frame.contains(&"A".repeat(57)));
+        assert!(frame.contains(&"B".repeat(57)));
+        for _ in 0..10 {
+            app.handle_event(special(KeyCode::PageDown));
+        }
+        assert_eq!(app.preview_scroll, 42 - app.screen.list_rows());
+        app.render();
+        assert!(out.take().contains(&format!("{:057}", 39)));
+        app.handle_event(special(KeyCode::Left));
+        app.render();
+        assert!(!out.take().contains("FOCUSED"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn focused_preview_handles_empty_text_resize_toggle_and_hidden_panes() {
+        let (mut app, d) = text_preview_app("preview-focus-lifecycle", "");
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.handle_event(ckey('f'));
+        assert_eq!(app.preview_scroll, 0);
+        app.handle_event(Event::Resize(80, 30));
+        assert!(!app.preview_focused);
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        app.handle_event(Event::Resize(120, 30));
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.apply(Action::TogglePreview);
+        assert!(!app.preview_focused && !app.preview.enabled);
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn preview_focus_preserves_directory_navigation_and_ignores_binary_files() {
+        let (mut app, d) = text_preview_app("preview-focus-targets", "\0binary");
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        let index = app.dir.entries.iter().position(|e| &*e.name == "subdir").unwrap();
+        app.set_cursor(index);
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        assert_eq!(app.dir.path, std::fs::canonicalize(d.join("subdir")).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An app on `pic.png` + `notes.txt`, with a graphics previewer for
+    /// `*.png` whose frame's image id is the pane size it was given ("WH").
+    #[cfg(unix)]
+    fn graphics_app(name: &str) -> (App, PathBuf, SharedBuf) {
+        let d = tmpdir(name);
+        std::fs::write(d.join("pic.png"), b"png").unwrap();
+        std::fs::write(d.join("notes.txt"), b"text\n").unwrap();
+        let previewers = vec![crate::config::PreviewerRule {
+            patterns: vec!["*.png".into()],
+            cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
+            graphics: true,
+        }];
+        let cfg = Config { previewers, ..Config::default() };
+        let out = SharedBuf::default();
+        let screen = Screen::new(Box::new(out.clone()), 120, 30);
+        let mut app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        app.preview.highlight = None;
+        app.preview.debounce = Duration::ZERO;
+        app.preview.enabled = true;
+        app.graphics = true;
+        app.dir.move_to_name("pic.png");
+        (app, d, out)
+    }
+
+    /// The pane body's top-left cell on a 120x30 screen, as a CUP sequence.
+    #[cfg(unix)]
+    const BODY_ORIGIN: &str = "\x1b[3;63H";
+
+    #[cfg(unix)]
+    #[test]
+    fn graphics_previews_need_the_probe_and_fill_the_pane_body() {
+        let (mut app, d, _) = graphics_app("gfxprobe");
+        app.graphics = false;
+        app.preview_on_hover();
+        drive_preview(&mut app);
+        assert!(app.preview.image().is_none(), "graphics rule ran without graphics");
+        assert!(preview_texts(&app)[0].starts_with("png"), "{:?}", preview_texts(&app));
+
+        // The probe's report re-picks the previewer for the hovered file.
+        let report = term::Report { graphics: true, typeahead: Vec::new() };
+        assert_eq!(app.settle_term(report), None);
+        drive_preview(&mut app);
+        // 120 cols: a 59-col pane minus its padding column; 30 rows minus 3.
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5827)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_image_follows_hover_overlays_and_quit() {
+        let (mut app, d, out) = graphics_app("gfxshow");
+        app.preview_on_hover();
+        drive_preview(&mut app);
+        app.dirty = Dirty::Full;
+        app.render();
+        // The body is blanked first, then the image goes over it.
+        let frame = out.take();
+        let at = frame.rfind(BODY_ORIGIN).expect("cursor to the pane body");
+        assert!(frame[at..].starts_with("\x1b[3;63H\x1b_Ga=T,i=5827,q=2,C=1;AAAA\x1b\\"), "{:?}", &frame[at..]);
+        assert!(frame[..at].contains("\x1b[29;63H"), "body rows blanked under the image");
+
+        // Redraws neither resend the image nor write the body under it.
+        app.dirty = Dirty::Full;
+        app.render();
+        let redraw = out.take();
+        assert!(!redraw.contains(BODY_ORIGIN) && !redraw.contains("\x1b_G"), "{redraw:?}");
+
+        // Overlays take the image down; closing them puts it back.
+        act(&mut app, Action::PluginMenu);
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        act(&mut app, Action::Esc);
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=T,i=5827"));
+
+        // Hovering a text file deletes the image before its preview is ready.
+        act(&mut app, Action::Next);
+        assert_eq!(app.dir.hovered_name(), Some("notes.txt"));
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+
+        // Quitting with an image up deletes it.
+        act(&mut app, Action::Prev);
+        drive_preview(&mut app);
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=T,i=5827"));
+        assert_eq!(app.run(), Flow::Quit(0)); // TestSource sends C-q
+        assert!(out.take().ends_with("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stepping_aside_stops_the_previewer_and_restarts_it_after() {
+        let (mut app, d, _) = graphics_app("gfxsuspend");
+        // Keeps running after its frame, as a playing video does.
+        app.cfg.previewers[0].cmd = r#"sh -c "printf '\033_Ga=T,i=1;AAAA\033\\\\'; sleep 30""#.into();
+        app.preview_on_hover();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.preview.image().is_none() && Instant::now() < deadline {
+            app.preview.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(app.preview.state, crate::preview::PreviewState::Running { .. }));
+        app.suspend_and_run("true", vec![]);
+        // The running job was dropped (killed); a fresh one is on its way.
+        assert!(matches!(app.preview.state, crate::preview::PreviewState::Debounce { .. }));
+        assert!(app.preview.image().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_frames_go_up_before_the_old_one_is_deleted() {
+        let (mut app, d, out) = graphics_app("gfxswap");
+        app.cfg.previewers[0].cmd =
+            r#"sh -c "printf '\033_Ga=T,i=1;AAAA\033\\\\'; sleep 0.2; printf '\033_Ga=T,i=2;AAAA\033\\\\'""#.into();
+        app.preview_on_hover();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        while app.preview.is_busy() && Instant::now() < deadline {
+            app.on_tick();
+            app.render();
+            output.push_str(&out.take());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let second = output.find("\x1b_Ga=T,i=2").expect("second frame");
+        let delete = output.find("\x1b_Ga=d,d=I,i=1,q=2").expect("first frame deleted");
+        assert!(output.find("\x1b_Ga=T,i=1").unwrap() < second && second < delete, "{output:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(unix)]
@@ -2657,25 +3359,33 @@ mod tests {
     }
 
     #[test]
-    fn tree_plugin_bound_to_s_unless_keys_claims_it() {
+    fn tree_plugin_bound_to_t_and_sort_to_s_unless_keys_claim_t() {
+        let t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
         let s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
         let src = || Box::new(TestSource::new());
         let d = tmpdir("treekey");
-        let app = App::new(Config::default(), d.clone(), Screen::new(Box::new(io::sink()), 80, 24), src()).unwrap();
+        let mut app = App::new(Config::default(), d.clone(), Screen::new(Box::new(io::sink()), 80, 24), src()).unwrap();
         let i = app.cfg.plugins.iter().position(|p| p.name == "tree").unwrap();
-        assert_eq!(app.keymap[&s], Action::PluginRun(i));
+        assert_eq!(app.keymap[&t], Action::PluginRun(i));
+        assert_eq!(app.keymap[&s], Action::CycleSort);
+        let next_sort = app.ctx[app.ctx_i].sort.next();
+        assert_eq!(app.handle_event(key('s')), None);
+        assert_eq!(app.ctx[app.ctx_i].sort, next_sort);
+        assert_eq!(app.dir.sort, next_sort);
 
-        let cfg = Config { keys: vec![("select".into(), "s".into())], ..Config::default() };
+        let cfg = Config { keys: vec![("select".into(), "t".into())], ..Config::default() };
         let app = App::new(cfg, d.clone(), Screen::new(Box::new(io::sink()), 80, 24), src()).unwrap();
-        assert_eq!(app.keymap[&s], Action::Select);
+        assert_eq!(app.keymap[&t], Action::Select);
+        assert_eq!(app.keymap[&s], Action::CycleSort);
         let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The shipped plugin against the real `tree`, when it's installed.
-    #[cfg(unix)]
     #[test]
     fn builtin_tree_plugin_shows_highlighted_folder_in_pane_and_pager() {
-        if !crate::plugin::which("tree") {
+        let cfg = Config::default();
+        let tree = cfg.plugins.iter().find(|p| p.name == "tree").unwrap();
+        if crate::plugin::missing_requirement(&tree.requires).is_some() {
             eprintln!("skipping: tree not installed");
             return;
         }
@@ -2690,7 +3400,7 @@ mod tests {
         app.preview.debounce = Duration::ZERO;
         for width in [120, 80] {
             app.screen = Screen::new(Box::new(io::sink()), width, 30);
-            app.handle_event(key('s'));
+            app.handle_event(key('t'));
             drive_preview(&mut app);
             let texts = if width >= 100 {
                 assert!(app.preview_pin.is_some());
@@ -2699,20 +3409,28 @@ mod tests {
                 let Mode::Pager { lines, .. } = &app.mode else { panic!("expected pager") };
                 lines.iter().map(|line| line.text()).collect()
             };
-            assert_eq!(texts[0], folder.to_string_lossy(), "{texts:?}");
-            // --dirsfirst: the nested directory comes before inside.txt.
-            assert!(texts[1].ends_with("nested") && texts[2].ends_with("inner.txt"), "{texts:?}");
-            assert!(texts.last().unwrap().ends_with("2 files"), "{texts:?}");
+            #[cfg(unix)]
+            {
+                assert_eq!(texts[0], folder.to_string_lossy(), "{texts:?}");
+                // --dirsfirst: the nested directory comes before inside.txt.
+                assert!(texts[1].ends_with("nested") && texts[2].ends_with("inner.txt"), "{texts:?}");
+                assert!(texts.last().unwrap().ends_with("2 files"), "{texts:?}");
+            }
+            #[cfg(windows)]
+            assert!(texts.iter().any(|line| line.ends_with("SELECTED '$ FOLDER")), "{folder:?}: {texts:?}");
+            assert!(texts.iter().any(|line| line.ends_with("inside.txt")), "{texts:?}");
+            assert!(texts.iter().any(|line| line.ends_with("inner.txt")), "{texts:?}");
             assert!(!texts.iter().any(|line| line.ends_with("alpha")), "{texts:?}");
             app.handle_event(special(KeyCode::Esc));
         }
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_tree_plugin_uses_current_directory_when_empty() {
-        if !crate::plugin::which("tree") {
+        let cfg = Config::default();
+        let tree = cfg.plugins.iter().find(|p| p.name == "tree").unwrap();
+        if crate::plugin::missing_requirement(&tree.requires).is_some() {
             eprintln!("skipping: tree not installed");
             return;
         }
@@ -2721,11 +3439,27 @@ mod tests {
         app.cd(&d.join("empty"));
         assert!(app.dir.hovered_path().is_none());
         app.preview.debounce = Duration::ZERO;
-        app.handle_event(key('s'));
-        drive_preview(&mut app);
-        let texts = preview_texts(&app);
-        assert_eq!(texts[0], app.dir.path.to_string_lossy(), "{texts:?}");
-        assert!(texts.last().unwrap().ends_with("0 files"), "{texts:?}");
+        for width in [120, 80] {
+            app.screen = Screen::new(Box::new(io::sink()), width, 30);
+            app.handle_event(key('t'));
+            drive_preview(&mut app);
+            let texts = if width >= 100 {
+                assert!(app.preview_pin.is_some());
+                preview_texts(&app)
+            } else {
+                let Mode::Pager { lines, .. } = &app.mode else { panic!("expected pager") };
+                lines.iter().map(|line| line.text()).collect()
+            };
+            #[cfg(unix)]
+            {
+                assert_eq!(texts[0], app.dir.path.to_string_lossy(), "{texts:?}");
+                assert!(texts.last().unwrap().ends_with("0 files"), "{texts:?}");
+            }
+            #[cfg(windows)]
+            assert!(texts.iter().any(|line| line.ends_with(r"\EMPTY")), "{texts:?}");
+            assert!(!texts.iter().any(|line| line.ends_with("alpha")), "{texts:?}");
+            app.handle_event(special(KeyCode::Esc));
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2751,6 +3485,64 @@ mod tests {
         assert!(!m.contains_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn enter_opens_by_rule_kitim_or_editor_and_skips_unknown() {
+        // Files must exist before App::new loads the directory.
+        let d = tmpdir("openact");
+        std::fs::write(d.join("doc.pdf"), b"%PDF-1.4 noise").unwrap();
+        // Media files get binary heads: real ones aren't text either.
+        std::fs::write(d.join("pic.png"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        std::fs::write(d.join("song.flac"), [0x66, 0x4c, 0x61, 0x43, 0, 1, 2]).unwrap();
+        std::fs::write(d.join("t.txt"), b"plain text\n").unwrap();
+        std::fs::write(d.join("blob.dat"), [0u8, 1, 2, 3]).unwrap();
+        let src = TestSource::new();
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(Config::default(), d.clone(), screen, Box::new(src)).unwrap();
+        app.sel.file = d.join(".sel");
+        app.cfg.openers = vec![crate::config::OpenerRule { patterns: vec!["*.pdf".into()], cmd: "kitpdf -z 2".into() }];
+        let hover = |app: &mut App, want: &str| {
+            while app.dir.hovered_name() != Some(want) {
+                act(app, Action::Next);
+            }
+            app.dir.hovered_path().unwrap()
+        };
+
+        // A user rule wins, file name appended after its command.
+        let path = hover(&mut app, "doc.pdf");
+        assert_eq!(app.file_open(&path, "doc.pdf", false), FileOpen::Program("kitpdf -z 2 doc.pdf".into()));
+
+        // Built-in kitim: needs graphics and kitim installed, else unknown.
+        app.graphics = true;
+        let path = hover(&mut app, "pic.png");
+        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Program("kitim --fullscreen pic.png".into()));
+        let path = hover(&mut app, "song.flac");
+        assert_eq!(app.file_open(&path, "song.flac", false), FileOpen::Nothing);
+        app.graphics = false;
+        let path = hover(&mut app, "pic.png");
+        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Nothing);
+        app.graphics = true;
+
+        // Text opens in the editor; an unknown binary does nothing.
+        let path = hover(&mut app, "t.txt");
+        assert_eq!(app.file_open(&path, "t.txt", false), FileOpen::Edit);
+        let path = hover(&mut app, "blob.dat");
+        assert_eq!(app.file_open(&path, "blob.dat", true), FileOpen::Nothing);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn preview_pane_open_at_startup_previews_the_first_entry() {
+        let d = tmpdir("pstart");
+        std::fs::write(d.join("a.txt"), b"first\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.ui.preview = true;
+        let screen = Screen::new(Box::new(Vec::new()), 120, 30);
+        let app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        assert!(app.preview.is_busy(), "no preview requested before the first keypress");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn preview_targets_follow_hover() {
         let d = tmpdir("ptarget");
@@ -2760,6 +3552,7 @@ mod tests {
         cfg.previewers = vec![crate::config::PreviewerRule {
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
+            graphics: false,
         }];
         let src = TestSource::new();
         let screen = Screen::new(Box::new(Vec::new()), 120, 30);

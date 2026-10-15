@@ -30,6 +30,7 @@ Environment:
     VFM_SEL         Selection file override
     VFM_CONFIG_HOME Config/data directory override
     VFM_FCOLORS     File color overrides (type=attribute,... like NNN_FCOLORS)
+    VFM_NERD_FONT   File icons: 1/true to enable, 0/false to disable
     NO_COLOR        Disable colors entirely
 
 Keys: press ? inside vfm for the full list."

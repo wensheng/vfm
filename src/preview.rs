@@ -7,18 +7,42 @@
 //! cross-thread edges are the job's mpsc channel and `child.kill()` from the
 //! loop thread. `Drop for JobHandle` kills + reaps on a detached thread, so
 //! superseding a slow previewer never blocks input and leaves no zombies.
+//!
+//! Graphics previewers (see [`crate::graphics`]) produce image frames instead
+//! of lines. Only the latest frame is kept, for the App to forward to the
+//! terminal; their channel holds one frame, so a slow UI stalls the
+//! previewer instead of queueing megabytes of stale frames.
 
 use crate::ansi::AnsiFeeder;
+use crate::graphics::{Frame, Splitter};
 use crate::sort::natural_cmp;
 use crate::ui::Line;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 const MAX_LINES: usize = 20_000;
 const READ_BUF: usize = 64 * 1024;
+
+/// Bytes of a file's head checked to tell text from binary.
+const SNIFF_BYTES: usize = 8192;
+
+/// Programs tried, in order, for highlighted text previews. Debian and
+/// Ubuntu install bat as `batcat`.
+const BAT_NAMES: [&str; 2] = ["bat", "batcat"];
+
+/// bat flags for a pane: colors through the pipe, no decorations, no pager,
+/// and no wrapping, since the pane wraps lines itself.
+const BAT_FLAGS: [&str; 4] = ["--color=always", "--style=plain", "--paging=never", "--wrap=never"];
+
+/// The highlighter argv for text previews: bat, if `enabled` and
+/// `installed` finds it under one of its names.
+pub fn bat_argv(enabled: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+    let prog = BAT_NAMES.into_iter().filter(|_| enabled).find(|name| installed(name))?;
+    Some(std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect())
+}
 
 // ---------------------------------------------------------------- signature
 
@@ -45,7 +69,11 @@ pub fn make_sig(path: &Path, size: u64, mtime: i64, pane: (u16, u16), rule: usiz
 
 pub enum PreviewMsg {
     Lines(Vec<Line>),
+    /// A graphics previewer's next image.
+    Frame(Frame),
     Done { truncated: bool },
+    /// A graphics previewer ended without an image; the text is why.
+    Failed(String),
 }
 
 /// A running previewer child + its reader-thread channel. The Child lives
@@ -65,6 +93,18 @@ impl JobHandle {
         std::thread::Builder::new()
             .name("vfm-preview".into())
             .spawn(move || read_job(stdout, tx, max_bytes))?;
+        Ok(JobHandle { child: Some(child), rx })
+    }
+
+    /// Run a graphics previewer: stdout is cut into frames (see `graphics`).
+    pub fn spawn_graphics(mut command: Command) -> std::io::Result<JobHandle> {
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("vfm-preview".into())
+            .spawn(move || read_graphics(stdout, tx))?;
         Ok(JobHandle { child: Some(child), rx })
     }
 }
@@ -119,6 +159,34 @@ fn read_job(stdout: impl Read, tx: Sender<PreviewMsg>, max_bytes: usize) {
     let _ = tx.send(PreviewMsg::Done { truncated });
 }
 
+/// Graphics reader-thread body: stdout → frames, then Done, or Failed with
+/// the previewer's message if it drew nothing. Blocks while a frame waits.
+fn read_graphics(mut stdout: impl Read, tx: SyncSender<PreviewMsg>) {
+    let mut splitter = Splitter::default();
+    let mut frames = Vec::new();
+    let mut buf = vec![0u8; READ_BUF];
+    let mut drew = false;
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => splitter.feed(&buf[..n], &mut frames),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+        for frame in frames.drain(..) {
+            drew = true;
+            if tx.send(PreviewMsg::Frame(frame)).is_err() {
+                return; // receiver gone: job was superseded
+            }
+        }
+    }
+    let _ = tx.send(if drew {
+        PreviewMsg::Done { truncated: false }
+    } else {
+        PreviewMsg::Failed(splitter.message().unwrap_or_else(|| "no image".into()))
+    });
+}
+
 // ---------------------------------------------------------------- state
 
 /// What produces a preview's content.
@@ -128,6 +196,8 @@ pub enum Source {
     Builtin,
     /// A `[[previewer]]` argv; the path, width and height are appended.
     Previewer(Vec<String>),
+    /// A `graphics = true` previewer: same argv, but its output is frames.
+    Graphics(Vec<String>),
     /// A `>` plugin's command line, run through the shell in the current
     /// directory. Never cached: it describes the directory, which changes.
     Shell(String),
@@ -153,6 +223,8 @@ pub enum Tick {
     Quiet,
     /// New chunks arrived — repaint the preview pane.
     Chunks,
+    /// A graphics preview has a new frame; the text needs no repaint.
+    Frame,
     /// Job finished — repaint + statusbar hint update.
     Finished,
     /// Spawn failed — repaint (error shown in pane).
@@ -168,8 +240,14 @@ pub struct Preview {
     streaming_truncated: bool,
     streaming_sig: u64,
     cache: Vec<(u64, std::sync::Arc<[Line]>, bool)>,
+    /// Latest frame of the current graphics preview, and its sequence number.
+    image: Option<(u64, Frame)>,
+    frames: u64,
     pub debounce: Duration,
     pub max_bytes: usize,
+    /// Runs text files that no `[[previewer]]` rule matches (see [`bat_argv`]);
+    /// `None` keeps the built-in plain-text head.
+    pub highlight: Option<Vec<String>>,
     /// Snapshot taken at request() time; used when the debounce expires.
     pane: (u16, u16),
     env: Vec<(String, String)>,
@@ -185,8 +263,11 @@ impl Preview {
             streaming_truncated: false,
             streaming_sig: 0,
             cache: Vec::with_capacity(8),
+            image: None,
+            frames: 0,
             debounce,
             max_bytes,
+            highlight: None,
             pane: (80, 24),
             env: Vec::new(),
             cwd: PathBuf::from("."),
@@ -213,6 +294,11 @@ impl Preview {
         }
     }
 
+    /// The current graphics frame, numbered so a new one is recognizable.
+    pub fn image(&self) -> Option<(u64, &Frame)> {
+        self.image.as_ref().map(|(seq, frame)| (*seq, frame))
+    }
+
     /// Lines to render + truncated flag, from whichever state has content.
     pub fn lines(&self) -> Option<(&[Line], bool)> {
         match &self.state {
@@ -231,6 +317,7 @@ impl Preview {
         self.streaming.clear();
         self.streaming_truncated = false;
         self.streaming_sig = 0;
+        self.image = None;
         if let Some((lines, truncated)) = self.cache_hit(target.sig) {
             self.state = PreviewState::Done { sig: target.sig, lines, truncated };
             return;
@@ -242,6 +329,7 @@ impl Preview {
     pub fn disable(&mut self) {
         self.state = PreviewState::Idle;
         self.streaming.clear();
+        self.image = None;
     }
 
     fn sig_matches(&self, sig: u64) -> bool {
@@ -307,6 +395,20 @@ impl Preview {
                     }
                     tick = Tick::Chunks;
                 }
+                Ok(PreviewMsg::Frame(frame)) => {
+                    // The first frame replaces the pane's old content: full
+                    // repaint. Later ones only swap the image. One per tick:
+                    // older frames would be overwritten unseen.
+                    let first = self.image.is_none();
+                    self.frames += 1;
+                    self.image = Some((self.frames, frame));
+                    return if first { Tick::Chunks } else { Tick::Frame };
+                }
+                Ok(PreviewMsg::Failed(err)) => {
+                    let sig = target.sig;
+                    self.state = PreviewState::Failed { sig, err };
+                    return Tick::Failed;
+                }
                 Ok(PreviewMsg::Done { truncated }) => {
                     let truncated = self.streaming_truncated || truncated;
                     let lines: std::sync::Arc<[Line]> = std::mem::take(&mut self.streaming).into();
@@ -333,16 +435,20 @@ impl Preview {
 
     /// Transition Debounce → Running (external command) or Done (builtin).
     fn start(&mut self, target: Target) -> Tick {
+        let graphics = matches!(target.source, Source::Graphics(_));
         let command = match &target.source {
-            Source::Builtin => {
-                let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
-                let sig = target.sig;
-                let lines: std::sync::Arc<[Line]> = lines.into();
-                self.cache_put(sig, lines.clone(), truncated);
-                self.state = PreviewState::Done { sig, lines, truncated };
-                return Tick::Finished;
-            }
-            Source::Previewer(argv) => {
+            Source::Builtin => match self.highlighter(&target.path) {
+                Some(command) => command,
+                None => {
+                    let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
+                    let sig = target.sig;
+                    let lines: std::sync::Arc<[Line]> = lines.into();
+                    self.cache_put(sig, lines.clone(), truncated);
+                    self.state = PreviewState::Done { sig, lines, truncated };
+                    return Tick::Finished;
+                }
+            },
+            Source::Previewer(argv) | Source::Graphics(argv) => {
                 let Some((prog, args)) = argv.split_first() else {
                     self.state = PreviewState::Failed { sig: target.sig, err: "empty command".into() };
                     return Tick::Failed;
@@ -358,18 +464,59 @@ impl Preview {
             }
             Source::Shell(line) => crate::plugin::shell_command(line, &self.cwd, &self.env),
         };
-        match JobHandle::spawn(command, self.max_bytes) {
+        let program = command.get_program().to_string_lossy().into_owned();
+        let job = if graphics { JobHandle::spawn_graphics(command) } else { JobHandle::spawn(command, self.max_bytes) };
+        match job {
             Ok(job) => {
                 self.state = PreviewState::Running { target, job };
                 Tick::Quiet
             }
             Err(e) => {
                 let sig = target.sig;
-                self.state = PreviewState::Failed { sig, err: format!("spawn: {e}") };
+                self.state = PreviewState::Failed { sig, err: format!("{program}: {e}") };
                 Tick::Failed
             }
         }
     }
+}
+
+impl Preview {
+    /// The highlighter command for `path` if it is a readable text file.
+    /// Binary files stay built-in: bat passes them through when piped.
+    /// Only lines that can show are asked for, since highlighting a large
+    /// file whole takes seconds.
+    fn highlighter(&self, path: &Path) -> Option<Command> {
+        let (prog, flags) = self.highlight.as_ref()?.split_first()?;
+        if !is_text_file(path) {
+            return None;
+        }
+        let mut c = Command::new(prog);
+        c.args(flags)
+            .arg(format!("--line-range=:{}", self.pane.1.max(1)))
+            .arg("--")
+            .arg(path)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .current_dir(&self.cwd);
+        Some(c)
+    }
+}
+
+/// A regular file (not a symlink) whose head reads as text.
+fn is_text_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && head_is_text(path)
+}
+
+/// Whether opening `path` lands in a text editor: a regular file — symlinks
+/// followed, so their target opens — whose head reads as text. Directories
+/// and special files are not; their heads aren't read, so pipes can't stall.
+pub fn opens_as_text(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file()) && head_is_text(path)
+}
+
+fn head_is_text(path: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    let mut head = Vec::with_capacity(SNIFF_BYTES);
+    f.take(SNIFF_BYTES as u64).read_to_end(&mut head).is_ok() && !looks_binary(&head)
 }
 
 // ---------------------------------------------------------------- builtin
@@ -454,7 +601,7 @@ fn builtin_file(path: &Path, max_bytes: usize) -> (Vec<Line>, bool) {
 
 /// NUL in the head, or >10% control bytes, means "don't pretend this is text".
 fn looks_binary(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(8192)];
+    let head = &data[..data.len().min(SNIFF_BYTES)];
     if head.contains(&0) {
         return true;
     }
@@ -536,6 +683,24 @@ mod tests {
     }
 
     #[test]
+    fn opens_as_text_follows_symlinks_and_rejects_the_rest() {
+        let d = tmpdir("opentext");
+        std::fs::write(d.join("t.txt"), b"hi\n").unwrap();
+        std::fs::write(d.join("empty"), b"").unwrap();
+        std::fs::write(d.join("b.dat"), [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).unwrap();
+        assert!(opens_as_text(&d.join("t.txt")));
+        assert!(opens_as_text(&d.join("empty")));
+        assert!(!opens_as_text(&d.join("b.dat")));
+        assert!(!opens_as_text(&d)); // a directory
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("t.txt", d.join("link.txt")).unwrap();
+            assert!(opens_as_text(&d.join("link.txt")));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn binary_sniff() {
         assert!(looks_binary(&[0x7f, b'E', b'L', b'F', 0, 1, 2, 3]));
         assert!(!looks_binary(b"plain text\nwith lines\n"));
@@ -568,6 +733,7 @@ mod tests {
             match job.rx.try_recv() {
                 Ok(PreviewMsg::Lines(ls)) => got = ls,
                 Ok(PreviewMsg::Done { .. }) => break,
+                Ok(PreviewMsg::Frame(_) | PreviewMsg::Failed(_)) => panic!("text job sent graphics"),
                 Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
                 Err(TryRecvError::Disconnected) => panic!("reader died early"),
             }
@@ -579,6 +745,107 @@ mod tests {
         // The real assertion is absence of a leaked `sleep 30` child — if
         // kill/reap were broken, this process would hold a live child here.
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A graphics previewer printing `script`'s output, as `sh -c` runs it.
+    #[cfg(unix)]
+    fn graphics_preview(d: &Path, script: &str) -> Preview {
+        let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
+        pv.set_context((40, 20), Vec::new(), d);
+        let argv = vec!["sh".into(), "-c".into(), script.into(), "sh".into()];
+        let path = d.join("pic.png");
+        pv.request(Target { path, source: Source::Graphics(argv), sig: 7 }, Instant::now());
+        pv
+    }
+
+    /// Ticks `pv` until `done` holds, or panics after 5 s.
+    #[cfg(unix)]
+    fn tick_until(pv: &mut Preview, done: impl Fn(&Preview) -> bool) -> Vec<Tick> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ticks = Vec::new();
+        while !done(pv) {
+            assert!(Instant::now() < deadline, "state: {:?}", pv.error());
+            ticks.push(pv.tick(Instant::now()));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        ticks
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graphics_job_streams_numbered_frames_with_args_appended() {
+        let d = tmpdir("gfx");
+        // Two frames; the second's id echoes the appended width and height.
+        let script = r#"printf '\033_Ga=T,i=11;AAAA\033\\'; printf '\033_Ga=T,i=%s%s;AAAA\033\\' "$2" "$3""#;
+        let mut pv = graphics_preview(&d, script);
+        let ticks = tick_until(&mut pv, |pv| matches!(pv.state, PreviewState::Done { .. }));
+        // The first frame repaints the pane; later ones only swap the image.
+        let frames: Vec<Tick> = ticks.into_iter().filter(|t| matches!(t, Tick::Chunks | Tick::Frame)).collect();
+        assert_eq!(frames, [Tick::Chunks, Tick::Frame]);
+        let (seq, frame) = pv.image().expect("last frame kept");
+        assert_eq!((seq, frame.id), (2, Some(4020)));
+        assert!(pv.lines().is_some_and(|(lines, _)| lines.is_empty()));
+        // Moving to another target drops the image at once.
+        let other = Target { path: d.join("x"), source: Source::Builtin, sig: 8 };
+        pv.request(other, Instant::now());
+        assert!(pv.image().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graphics_job_without_frames_fails_with_its_message() {
+        let d = tmpdir("gfxfail");
+        let mut pv = graphics_preview(&d, "echo 'no video stream'; exit 1");
+        tick_until(&mut pv, |pv| pv.error().is_some());
+        assert_eq!(pv.error(), Some("no video stream"));
+        let mut pv = graphics_preview(&d, "exit 0");
+        tick_until(&mut pv, |pv| pv.error().is_some());
+        assert_eq!(pv.error(), Some("no image"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_files_go_through_the_highlighter_and_the_rest_stays_builtin() {
+        let d = tmpdir("highlight");
+        std::fs::write(d.join("t.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(d.join("bin.dat"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
+        pv.set_context((40, 24), Vec::new(), &d);
+        // Echoes the arguments vfm appends.
+        let echo = r#"printf 'HL %s %s %s\n' "$1" "$2" "$3""#;
+        pv.highlight = Some(vec!["sh".into(), "-c".into(), echo.into(), "sh".into()]);
+        let mut show = |name: &str, sig| {
+            let target = Target { path: d.join(name), source: Source::Builtin, sig };
+            pv.request(target, Instant::now());
+            run_to_done(&mut pv);
+            pv.lines().unwrap().0.iter().map(|l| l.text()).collect::<Vec<_>>()
+        };
+        let path = d.join("t.rs").display().to_string();
+        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:24 -- {path}")]);
+        assert_eq!(show("bin.dat", 2)[0], "binary: PNG image");
+        assert!(show("sub", 3).is_empty(), "empty dir listing");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bat_is_found_under_either_name_unless_disabled() {
+        let flags = |prog: &str| std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect::<Vec<_>>();
+        assert_eq!(bat_argv(true, |p| p == "bat"), Some(flags("bat")));
+        assert_eq!(bat_argv(true, |p| p == "batcat"), Some(flags("batcat")));
+        assert_eq!(bat_argv(true, |_| false), None);
+        assert_eq!(bat_argv(false, |_| true), None);
+    }
+
+    #[test]
+    fn spawn_failures_name_the_program() {
+        let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
+        let source = Source::Graphics(vec!["vfm-no-such-previewer".into()]);
+        pv.request(Target { path: PathBuf::from("x.png"), source, sig: 9 }, Instant::now());
+        assert_eq!(pv.tick(Instant::now()), Tick::Failed);
+        assert!(pv.error().unwrap().starts_with("vfm-no-such-previewer: "), "{:?}", pv.error());
     }
 
     #[cfg(unix)]
