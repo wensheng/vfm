@@ -32,7 +32,7 @@ Press `?` inside vfm for the full key list. The essentials:
 | Keys | Action |
 |---|---|
 | `j` `k` / arrows, `g` `G`, `C-d` `C-u` | move |
-| `l` / `Enter`, `h` | enter, parent |
+| `l` / `Enter`, `h` | enter dir / open file, parent |
 | `/` | filter (`C-n` cycles substring → fuzzy → regex) |
 | `1`–`8`, `Tab` | contexts (tabs) |
 | `Space`, `m`, `a`, `A` | select, range, all, invert |
@@ -106,6 +106,10 @@ match = ["*.rs", "*.toml", "*.md"]
 run   = "bat --color=always --style=plain"
 # graphics = true         # run prints kitty graphics, not text (see below)
 
+[[opener]]                # Enter runs these fullscreen, file name appended
+match = ["*.pdf", "*.PDF"]
+run   = "kitpdf"
+
 [[plugin]]
 name     = "git status"
 cmd      = "| git status" # see "Plugin modes" below
@@ -174,6 +178,21 @@ match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
 run      = "kitim --preview"         # "kitim --sound --preview" with kitim_sound
 graphics = true
 ```
+
+### Opening files
+
+Enter on a directory enters it; on an executable, runs it. Other files open
+the first matching `[[opener]]` rule's `run` command fullscreen, with the
+file's quoted name appended (`kitpdf photo.pdf`). With no matching rule:
+
+- image, video and audio files open in
+  [kitim](https://github.com/wensheng/kitim) fullscreen — images fill the
+  screen and any key returns — when it is on `PATH` and the terminal
+  answered the kitty-graphics probe,
+- files whose head reads as text open in `$VISUAL`/`$EDITOR` (vi by default),
+- anything else does nothing — no editor over binary bytes.
+
+`e` always opens `$EDITOR` on the hovered file, whatever it is.
 
 ### Plugin modes
 

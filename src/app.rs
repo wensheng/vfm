@@ -98,6 +98,17 @@ struct Shown {
     id: Option<u32>,
 }
 
+/// What Enter does with a hovered, non-executable file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileOpen {
+    /// Run this command line fullscreen, via `suspend_and_run`.
+    Program(String),
+    /// Open it in `$EDITOR` (vi by default).
+    Edit,
+    /// No handler: Enter does nothing.
+    Nothing,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Flow {
     Continue,
@@ -1054,22 +1065,56 @@ impl App {
     }
 
     fn open_hovered(&mut self) -> Option<Flow> {
-        let (path, is_dir, is_exec) = {
+        let (path, name, is_dir, is_exec) = {
             let e = self.dir.entries.get(self.dir.cursor)?;
-            (self.dir.path_at(self.dir.cursor)?, e.is_dir(), e.flags.has(EntryFlags::EXEC))
+            (self.dir.path_at(self.dir.cursor)?, e.name.clone(), e.is_dir(), e.flags.has(EntryFlags::EXEC))
         };
         if is_dir {
             self.cd(&path);
             return None;
         }
-        // Files: executables run in-place; everything else opens in $EDITOR.
+        // Files: executables run in-place; the rest is `file_open`'s call.
         if is_exec {
-            let name = file_name_of(&path);
-            self.suspend_and_run(&format!("./{}", shquote(&name)), vec![]);
+            let file = file_name_of(&path);
+            self.suspend_and_run(&format!("./{}", shquote(&file)), vec![]);
             return None;
         }
-        self.external_edit();
+        match self.file_open(&path, &name, plugin::which("kitim")) {
+            FileOpen::Program(cmdline) => self.suspend_and_run(&cmdline, vec![]),
+            FileOpen::Edit => self.external_edit(),
+            FileOpen::Nothing => {}
+        }
         None
+    }
+
+    /// What Enter does with a hovered file.
+    ///
+    /// A matching `[[opener]]` rule runs fullscreen, first match winning.
+    /// Otherwise kitim plays images, video and audio — `kitim_installed` is
+    /// passed in so tests decide it — but only on a terminal that answered
+    /// the graphics probe, since kitim would show nothing without it. What's
+    /// left opens in the editor if its head reads as text, else nothing: no
+    /// more vi over binary bytes.
+    fn file_open(&self, path: &Path, name: &str, kitim_installed: bool) -> FileOpen {
+        if let Some(rule) = self
+            .cfg
+            .openers
+            .iter()
+            .find(|r| r.patterns.iter().any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes())))
+        {
+            return FileOpen::Program(format!("{} {}", rule.cmd.trim(), shquote(&file_name_of(path))));
+        }
+        if self.graphics && kitim_installed && crate::config::is_kitim_media(name) {
+            // --fullscreen: images fill the screen and wait for a key, so
+            // the viewer doesn't flash and vanish.
+            let file = shquote(&file_name_of(path));
+            return FileOpen::Program(format!("kitim --fullscreen {file}"));
+        }
+        if crate::preview::opens_as_text(path) {
+            FileOpen::Edit
+        } else {
+            FileOpen::Nothing
+        }
     }
 
     /// Suspend the TUI, run a command line in the current dir, resume.
@@ -2231,7 +2276,7 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "vfm — keys",
         "",
         "  j/k or arrows      move            h/Left       parent dir",
-        "  l/Right            enter dir       Enter        open (dir/file)",
+        "  l/Right            enter dir       Enter        open (dir/media/text)",
         "  g / G              top / bottom    C-d / C-u    half page",
         "  J ±n               jump n rows     C-y          newest entry",
         "  '                  first file",
@@ -3055,6 +3100,52 @@ mod tests {
         apply_key_config(&mut m, &[("quit".into(), "Z".into())]);
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE)], Action::Quit);
         assert!(!m.contains_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_opens_by_rule_kitim_or_editor_and_skips_unknown() {
+        // Files must exist before App::new loads the directory.
+        let d = tmpdir("openact");
+        std::fs::write(d.join("doc.pdf"), b"%PDF-1.4 noise").unwrap();
+        // Media files get binary heads: real ones aren't text either.
+        std::fs::write(d.join("pic.png"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        std::fs::write(d.join("song.flac"), [0x66, 0x4c, 0x61, 0x43, 0, 1, 2]).unwrap();
+        std::fs::write(d.join("t.txt"), b"plain text\n").unwrap();
+        std::fs::write(d.join("blob.dat"), [0u8, 1, 2, 3]).unwrap();
+        let src = TestSource::new();
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(Config::default(), d.clone(), screen, Box::new(src)).unwrap();
+        app.sel.file = d.join(".sel");
+        app.cfg.openers = vec![crate::config::OpenerRule { patterns: vec!["*.pdf".into()], cmd: "kitpdf -z 2".into() }];
+        let hover = |app: &mut App, want: &str| {
+            while app.dir.hovered_name() != Some(want) {
+                act(app, Action::Next);
+            }
+            app.dir.hovered_path().unwrap()
+        };
+
+        // A user rule wins, file name appended after its command.
+        let path = hover(&mut app, "doc.pdf");
+        assert_eq!(app.file_open(&path, "doc.pdf", false), FileOpen::Program("kitpdf -z 2 doc.pdf".into()));
+
+        // Built-in kitim: needs graphics and kitim installed, else unknown.
+        app.graphics = true;
+        let path = hover(&mut app, "pic.png");
+        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Program("kitim --fullscreen pic.png".into()));
+        let path = hover(&mut app, "song.flac");
+        assert_eq!(app.file_open(&path, "song.flac", false), FileOpen::Nothing);
+        app.graphics = false;
+        let path = hover(&mut app, "pic.png");
+        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Nothing);
+        app.graphics = true;
+
+        // Text opens in the editor; an unknown binary does nothing.
+        let path = hover(&mut app, "t.txt");
+        assert_eq!(app.file_open(&path, "t.txt", false), FileOpen::Edit);
+        let path = hover(&mut app, "blob.dat");
+        assert_eq!(app.file_open(&path, "blob.dat", true), FileOpen::Nothing);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

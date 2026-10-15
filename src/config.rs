@@ -19,6 +19,8 @@ pub struct Config {
     pub theme: Theme,
     /// Extension/filename globs → preview command, first match wins.
     pub previewers: Vec<PreviewerRule>,
+    /// Extension/filename globs → fullscreen open command, first match wins.
+    pub openers: Vec<OpenerRule>,
     /// Named action plugins.
     pub plugins: Vec<PluginDef>,
     /// Key remaps (action name → key description).
@@ -62,6 +64,13 @@ pub struct PreviewCfg {
 }
 
 #[derive(Clone, Debug)]
+pub struct OpenerRule {
+    pub patterns: Vec<String>,
+    /// Runs fullscreen with the file's quoted name appended.
+    pub cmd: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct PreviewerRule {
     pub patterns: Vec<String>,
     pub cmd: String,
@@ -76,6 +85,20 @@ const KITIM_TYPES: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "tga", "qoi", "pnm", "ppm", "pgm", "pbm",
     "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "mpg", "mpeg", "3gp",
 ];
+
+/// Audio types kitim plays but can't preview: no picture to show.
+const KITIM_AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "alac", "aiff", "aif"];
+
+/// Whether Enter opens `name` in kitim: an image, video or audio extension,
+/// in any case. kitim itself decides if the terminal can show it.
+pub fn is_kitim_media(name: &str) -> bool {
+    // Path::extension treats ".png" as a hidden file with no extension.
+    let Some(ext) = std::path::Path::new(name).extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    KITIM_TYPES.iter().chain(KITIM_AUDIO).any(|t| ext == *t)
+}
 
 /// The rule `[preview] kitim = true` adds: kitim's embedded preview mode,
 /// which takes the path, width and height vfm appends. With `sound`, videos
@@ -138,6 +161,7 @@ impl Default for Config {
             },
             theme: Theme::default(),
             previewers: Vec::new(),
+            openers: Vec::new(),
             plugins: default_plugins(),
             keys: Vec::new(),
         }
@@ -263,6 +287,26 @@ impl Config {
         // After the user's rules: first match wins, so theirs take precedence.
         if self.preview.kitim {
             self.previewers.push(kitim_rule(self.preview.kitim_sound));
+        }
+        // [[opener]] definitions
+        if let Some(rules) = t.get("opener").and_then(|v| v.as_array()) {
+            for r in rules {
+                let Some(tbl) = r.as_table() else { continue };
+                let Some(cmd) = tbl.get("run").and_then(|v| v.as_str()).map(String::from) else {
+                    errs.push("[[opener]] missing `run`".into());
+                    continue;
+                };
+                let patterns: Vec<String> = tbl
+                    .get("match")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if patterns.is_empty() {
+                    errs.push("[[opener]] missing `match`".into());
+                    continue;
+                }
+                self.openers.push(OpenerRule { patterns, cmd });
+            }
         }
         // [[plugin]] definitions
         if let Some(rules) = t.get("plugin").and_then(|v| v.as_array()) {
@@ -523,6 +567,32 @@ graphics = true
         let t: toml::Table = "[preview]\nbat = false\n".parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert!(!cfg.preview.bat);
+    }
+
+    #[test]
+    fn opener_rules_parse_and_kitim_media_types() {
+        let mut cfg = Config::default();
+        let t: toml::Table = r#"
+[[opener]]
+match = ["*.pdf", "*.PDF"]
+run = "kitpdf -z 2"
+
+[[opener]]
+run = "no patterns"
+"#
+        .parse()
+        .unwrap();
+        let errs = cfg.apply_table(&t);
+        assert_eq!(cfg.openers.len(), 1);
+        assert_eq!((cfg.openers[0].cmd.as_str(), cfg.openers[0].patterns.len()), ("kitpdf -z 2", 2));
+        assert_eq!(errs, ["[[opener]] missing `match`"]);
+
+        for name in ["a.PNG", "b.mp4", "c.MOV", "song.flac", "x.jpeg"] {
+            assert!(is_kitim_media(name), "{name}");
+        }
+        for name in ["x.txt", "png", "a.mp4x", "archive.tar.gz", ".png"] {
+            assert!(!is_kitim_media(name), "{name}");
+        }
     }
 
     #[test]

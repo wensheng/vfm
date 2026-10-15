@@ -503,9 +503,17 @@ impl Preview {
 
 /// A regular file (not a symlink) whose head reads as text.
 fn is_text_file(path: &Path) -> bool {
-    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
-        return false;
-    }
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && head_is_text(path)
+}
+
+/// Whether opening `path` lands in a text editor: a regular file — symlinks
+/// followed, so their target opens — whose head reads as text. Directories
+/// and special files are not; their heads aren't read, so pipes can't stall.
+pub fn opens_as_text(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file()) && head_is_text(path)
+}
+
+fn head_is_text(path: &Path) -> bool {
     let Ok(f) = std::fs::File::open(path) else { return false };
     let mut head = Vec::with_capacity(SNIFF_BYTES);
     f.take(SNIFF_BYTES as u64).read_to_end(&mut head).is_ok() && !looks_binary(&head)
@@ -672,6 +680,24 @@ mod tests {
 
     fn fs_create(p: &Path) {
         std::fs::create_dir(p).unwrap();
+    }
+
+    #[test]
+    fn opens_as_text_follows_symlinks_and_rejects_the_rest() {
+        let d = tmpdir("opentext");
+        std::fs::write(d.join("t.txt"), b"hi\n").unwrap();
+        std::fs::write(d.join("empty"), b"").unwrap();
+        std::fs::write(d.join("b.dat"), [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).unwrap();
+        assert!(opens_as_text(&d.join("t.txt")));
+        assert!(opens_as_text(&d.join("empty")));
+        assert!(!opens_as_text(&d.join("b.dat")));
+        assert!(!opens_as_text(&d)); // a directory
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("t.txt", d.join("link.txt")).unwrap();
+            assert!(opens_as_text(&d.join("link.txt")));
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
