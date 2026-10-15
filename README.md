@@ -14,6 +14,8 @@ Linux, macOS and Windows.
   supported) can be a previewer. Image and video previews, through
   [kitim](https://github.com/wensheng/kitim), and PDF/EPUB previews through
   [kitpdf](https://github.com/wensheng/kitpdf), on terminals with kitty graphics.
+  Inside the Vivido terminal, [vivi](https://github.com/vivido-dev/vivi) and
+  [vvrd](https://github.com/vivido-dev/vvrd) take their place.
 
 ## Build
 
@@ -97,9 +99,9 @@ smartcase = true
 enabled     = true
 debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
-kitim       = false       # image/video previews via kitim (see "Built-in plugin: kitim")
+kitim       = false       # image/video previews via kitim, or vivi in Vivido (see "Built-in plugin: kitim")
 kitim_sound = false       # and play videos' sound in those previews
-kitpdf      = false       # PDF/EPUB previews with focused page navigation
+kitpdf      = false       # PDF/EPUB previews with page navigation; vvrd in Vivido adds SVG, Markdown
 bat         = true        # highlight text previews with bat (or batcat), if installed
 
 [colors]                  # name, 0-255, or 0xRRGGBB
@@ -116,6 +118,7 @@ quit = "C-x"
 match = ["*.rs", "*.toml", "*.md"]
 run   = "bat --color=always --style=plain"
 # graphics = true         # run prints kitty graphics, not text (see below)
+# vivid = true            # run draws through Vivid itself (see below)
 
 [[opener]]                # Enter runs these fullscreen, file name appended
 match = ["*.pdf", "*.PDF"]
@@ -174,12 +177,31 @@ sequences, and forces `q=2` and `C=1`, so a previewer can't move the screen or
 make the terminal answer on vfm's input. Plain text that isn't part of a frame
 is shown as the error when no frame arrives.
 
-With `interactive = true` (requires `graphics = true`), stdin stays open.
+With `interactive = true` (requires `graphics = true` or `vivid = true`), stdin stays open.
 While focused, vfm sends newline-terminated `next`, `prev`, `first`, and `last`
 commands. The previewer clamps page boundaries and emits a new frame for each
 page change. Pipe writes run off the UI thread with a bounded queue; excess
 key repeats can be dropped while a previewer is stalled. Closing the pane,
 changing the hovered file, or resizing stops the child and closes its pipes.
+
+### Vivid previewers
+
+A `[[previewer]]` with `vivid = true` draws its own picture through the Vivid
+side channel, so vfm reads nothing from its stdout. vfm only uses such a rule
+inside Vivido, which it knows from `VIVID_ENDPOINT_CONTROL` and
+`VIVID_ROOT_SECRET`, and then prefers it to graphics rules after it. It runs as
+`<run…> PATH WIDTH HEIGHT COLUMN ROW`: the pane's body size, then its top-left
+cell as a 0-based grid position in the window, for a grid-positioned node.
+
+The previewer keeps its picture up until its stdin closes, then removes it and
+exits; vfm kills it if it is still running 300 ms later. Stdin carries
+newline-terminated `hide` and `show` while a menu or the pager covers the pane,
+and, with `interactive = true`, the page commands above. If the previewer exits
+on its own, the first line of its stderr is shown as the error. The terminal
+draws text over Vivid media, so vfm leaves the pane body blank meanwhile.
+
+Inside tmux or screen, Vivid grid positions are the outer window's, not the
+pane's, so pictures land in the wrong place there.
 
 ### Built-in plugin: kitpdf
 
@@ -208,14 +230,30 @@ a fresh preview. It requires a terminal that answers vfm's Kitty graphics
 probe; other terminals keep their normal fallback preview. Missing kitpdf
 or unreadable documents show an error in the pane.
 
-The built-in rule is added after custom rules. To use a specific executable,
-configure the equivalent rule instead:
+Inside Vivido, the same switch previews PDF, EPUB, SVG, and Markdown files
+through [vvrd](https://github.com/vivido-dev/vvrd)'s pane mode instead, even
+though Vivido also speaks kitty graphics. Install a vvrd with `--preview` on
+`PATH`. Focus and page keys work the same way, and Enter opens the file in vvrd
+full screen.
+
+The built-in rules are added after custom rules, vvrd's first. To use a
+specific executable, configure the equivalent rule instead:
 
 ```toml
 [[previewer]]
 match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]
 run = "kitpdf --preview"
 graphics = true
+interactive = true
+```
+
+In Vivido, put vvrd's rule before it:
+
+```toml
+[[previewer]]
+match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.MD"]
+run = "vvrd --preview"
+vivid = true
 interactive = true
 ```
 
@@ -236,6 +274,11 @@ upper case. Animated GIFs and videos loop until you move the cursor. Videos
 are muted unless you also set `kitim_sound = true`; then their sound plays,
 and stops when you move off the file or vfm runs another program.
 
+Inside Vivido, the same switch previews those files through
+[vivi](https://github.com/vivido-dev/vivi)'s pane mode instead (`vivi
+--preview`, or `vivi --sound --preview`), even though Vivido also speaks kitty
+graphics. Install a vivi with `--preview` on `PATH`.
+
 That's all the configuration needed. Behind the switch, vfm adds a rule like
 the one below, after your own `[[previewer]]` rules. Don't copy it into your
 config: a rule of yours wins for the files it matches, so it would replace
@@ -243,6 +286,11 @@ the built-in one there, `kitim_sound` included. Write one only to change
 something, such as a kitim that isn't on `PATH` or other file types:
 
 ```toml
+[[previewer]]                        # Vivido only; first, so it wins there
+match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
+run      = "vivi --preview"          # "vivi --sound --preview" with kitim_sound
+vivid    = true
+
 [[previewer]]
 match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
 run      = "kitim --preview"         # "kitim --sound --preview" with kitim_sound
@@ -255,6 +303,9 @@ Enter on a directory enters it; on an executable, runs it. Other files open
 the first matching `[[opener]]` rule's `run` command fullscreen, with the
 file's quoted name appended (`kitpdf photo.pdf`). With no matching rule:
 
+- inside Vivido, PDF, EPUB, SVG and Markdown files open in vvrd, and image,
+  video and audio files in `vivi --fullscreen`, when those are on `PATH`
+  (`e` still edits Markdown),
 - image, video and audio files open in
   [kitim](https://github.com/wensheng/kitim) fullscreen — images fill the
   screen and any key returns — when it is on `PATH` and the terminal

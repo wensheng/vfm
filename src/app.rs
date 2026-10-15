@@ -356,9 +356,27 @@ impl App {
 
     // ------------------------------------------------------------ loop
 
+    /// Adopts the host terminal's category and its probe, from [`term::detect`].
+    ///
+    /// Vivid is known from the environment at once, so its previewers take
+    /// over the pane now rather than after the probe.
+    pub fn set_term(&mut self, kind: term::Kind, probe: Option<term::Probe>) {
+        let before = self.hovered_rule();
+        (self.term, self.probe) = (kind, probe);
+        if self.hovered_rule() != before {
+            self.preview_supersede();
+        }
+    }
+
+    /// The previewer rule for the hovered entry, as the terminal now stands.
+    fn hovered_rule(&self) -> Option<usize> {
+        self.dir.hovered_name().and_then(|name| self.match_previewer(name))
+    }
+
     pub fn run(&mut self) -> Flow {
         let flow = self.event_loop();
-        // Images outlive vfm's text unless deleted.
+        // Images outlive vfm's text unless deleted; Vivid pictures, their previewer.
+        self.preview.stop();
         self.hide_graphics();
         self.screen.flush();
         flow
@@ -404,10 +422,12 @@ impl App {
     /// Records the terminal probe's verdict and replays the keys it swallowed.
     fn settle_term(&mut self, report: term::Report) -> Option<Flow> {
         self.probe = None;
+        let before = self.hovered_rule();
         self.graphics = report.graphics;
         self.term = self.term.settle(report.graphics);
-        // Graphics previewers were skipped until now; re-pick the hovered one.
-        if self.graphics && self.cfg.previewers.iter().any(|r| r.graphics) {
+        // Graphics previewers were skipped until now; re-pick the hovered
+        // one if that changes it. A running Vivid preview keeps going.
+        if self.hovered_rule() != before {
             self.preview_supersede();
         }
         report.typeahead.into_iter().find_map(|k| self.handle_event(Event::Key(k)))
@@ -1090,7 +1110,7 @@ impl App {
                         .dir
                         .hovered_name()
                         .and_then(|n| self.match_previewer(n))
-                        .is_some_and(|i| self.cfg.previewers[i].graphics)
+                        .is_some_and(|i| self.cfg.previewers[i].graphics || self.cfg.previewers[i].vivid)
                     && self.dir.hovered_path().is_some_and(|p| crate::preview::opens_as_text(&p))))
         {
             self.preview_focused = true;
@@ -1113,7 +1133,7 @@ impl App {
             self.suspend_and_run(&format!("./{}", shquote(&file)), vec![]);
             return None;
         }
-        match self.file_open(&path, &name, plugin::which("kitim")) {
+        match self.file_open(&path, &name, &plugin::which) {
             FileOpen::Program(cmdline) => self.suspend_and_run(&cmdline, vec![]),
             FileOpen::Edit => self.external_edit(),
             FileOpen::Nothing => {}
@@ -1124,12 +1144,13 @@ impl App {
     /// What Enter does with a hovered file.
     ///
     /// A matching `[[opener]]` rule runs fullscreen, first match winning.
-    /// Otherwise kitim plays images, video and audio — `kitim_installed` is
-    /// passed in so tests decide it — but only on a terminal that answered
-    /// the graphics probe, since kitim would show nothing without it. What's
-    /// left opens in the editor if its head reads as text, else nothing: no
-    /// more vi over binary bytes.
-    fn file_open(&self, path: &Path, name: &str, kitim_installed: bool) -> FileOpen {
+    /// Inside Vivid, vvrd reads PDF, EPUB, SVG and Markdown, and vivi shows
+    /// images, video and audio. Otherwise kitim plays the media, but only on
+    /// a terminal that answered the graphics probe, since kitim would show
+    /// nothing without it. Each viewer must be `installed` — passed in so
+    /// tests decide it. What's left opens in the editor if its head reads as
+    /// text, else nothing: no more vi over binary bytes.
+    fn file_open(&self, path: &Path, name: &str, installed: &dyn Fn(&str) -> bool) -> FileOpen {
         if let Some(rule) = self
             .cfg
             .openers
@@ -1138,7 +1159,17 @@ impl App {
         {
             return FileOpen::Program(format!("{} {}", rule.cmd.trim(), shquote(&file_name_of(path))));
         }
-        if self.graphics && kitim_installed && crate::config::is_kitim_media(name) {
+        let file = || shquote(&file_name_of(path));
+        if self.term == term::Kind::Vivid {
+            if crate::config::is_vvrd_document(name) && installed("vvrd") {
+                return FileOpen::Program(format!("vvrd {}", file()));
+            }
+            if crate::config::is_kitim_media(name) && installed("vivi") {
+                // --fullscreen: images fill the window and wait for a key.
+                return FileOpen::Program(format!("vivi --fullscreen {}", file()));
+            }
+        }
+        if self.graphics && installed("kitim") && crate::config::is_kitim_media(name) {
             // --fullscreen: images fill the screen and wait for a key, so
             // the viewer doesn't flash and vanish.
             let file = shquote(&file_name_of(path));
@@ -1163,8 +1194,9 @@ impl App {
         env.extend(extra_env);
         // Re-entering the alternate screen wipes images; render() re-sends.
         self.hide_graphics();
-        // Stop the previewer meanwhile: a video would keep playing its sound.
-        self.preview.disable();
+        // Stop the previewer meanwhile: a video would keep playing its sound,
+        // and a Vivid one would draw over the program.
+        self.preview.stop();
         self.screen.flush();
         self.screen.leave();
         let res = plugin::run_fullscreen(cmdline, &dir, &env);
@@ -1598,14 +1630,22 @@ impl App {
         };
         let Some(path) = self.dir.hovered_path() else { return };
         let rule = self.match_previewer(&e.name);
-        let sig = make_sig(&path, e.size, e.mtime, (pw, self.screen.h), rule.unwrap_or(usize::MAX));
+        // The whole screen size: a Vivid picture's grid position depends on
+        // it, not just the pane's size.
+        let sig = make_sig(&path, e.size, e.mtime, (self.screen.w, self.screen.h), rule.unwrap_or(usize::MAX));
         let mut pane = (pw, self.screen.h);
         let source = match rule.map(|i| &self.cfg.previewers[i]) {
             Some(r) => {
                 let argv = crate::util::shlex(&r.cmd).unwrap_or_else(|| vec![r.cmd.clone()]);
-                if r.graphics {
+                if r.graphics || r.vivid {
                     // Exactly the body: an image may fill every cell it's given.
                     pane = (pw - 1, self.screen.list_rows() as u16);
+                }
+                if r.vivid {
+                    // Where sync_graphics puts kitty images: column, then row.
+                    let origin = (self.screen.w - pw + 1, 2);
+                    Source::Vivid { argv, origin, interactive: r.interactive }
+                } else if r.graphics {
                     if r.interactive { Source::InteractiveGraphics(argv) } else { Source::Graphics(argv) }
                 } else {
                     Source::Previewer(argv)
@@ -1663,10 +1703,12 @@ impl App {
         self.dirty = Dirty::Full;
     }
 
-    /// First rule matching `name`; graphics rules only if the terminal can.
+    /// First rule matching `name`; graphics rules only if the terminal can,
+    /// Vivid rules only inside Vivid.
     fn match_previewer(&self, name: &str) -> Option<usize> {
         self.cfg.previewers.iter().position(|r| {
             (self.graphics || !r.graphics)
+                && (self.term == term::Kind::Vivid || !r.vivid)
                 && r.patterns
                     .iter()
                     .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
@@ -1854,6 +1896,8 @@ impl App {
     /// so every image is cleared before it goes up.
     fn sync_graphics(&mut self) {
         let origin = self.graphics_origin();
+        // A Vivid previewer draws by itself; it only needs to know when to hide.
+        self.preview.set_covered(origin.is_none());
         let frame = origin.and(self.preview.image());
         let old = self.shown;
         if old.map(|s| (s.seq, Some(s.origin))) == frame.map(|(seq, _)| (seq, origin)) {
@@ -2131,7 +2175,9 @@ impl App {
         let state = match (&self.preview.state, self.preview.error()) {
             (_, Some(e)) => format!("error: {e}"),
             // A running job with a frame up is playing, not loading.
-            (crate::preview::PreviewState::Running { .. }, _) if image.is_none() => "…".into(),
+            (crate::preview::PreviewState::Running { .. }, _) if image.is_none() && !self.preview.is_vivid() => {
+                "…".into()
+            }
             (crate::preview::PreviewState::Debounce { .. }, _) => "…".into(),
             _ => String::new(),
         };
@@ -3116,6 +3162,7 @@ mod tests {
                 executable.display()
             ),
             graphics: true,
+            vivid: false,
             interactive: true,
         }];
         app.preview_supersede();
@@ -3248,6 +3295,7 @@ mod tests {
             patterns: vec!["*.png".into()],
             cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
             graphics: true,
+            vivid: false,
             interactive: false,
         }];
         let cfg = Config { previewers, ..Config::default() };
@@ -3600,24 +3648,125 @@ mod tests {
 
         // A user rule wins, file name appended after its command.
         let path = hover(&mut app, "doc.pdf");
-        assert_eq!(app.file_open(&path, "doc.pdf", false), FileOpen::Program("kitpdf -z 2 doc.pdf".into()));
+        assert_eq!(app.file_open(&path, "doc.pdf", &|_| false), FileOpen::Program("kitpdf -z 2 doc.pdf".into()));
 
         // Built-in kitim: needs graphics and kitim installed, else unknown.
         app.graphics = true;
         let path = hover(&mut app, "pic.png");
-        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Program("kitim --fullscreen pic.png".into()));
+        assert_eq!(app.file_open(&path, "pic.png", &|_| true), FileOpen::Program("kitim --fullscreen pic.png".into()));
         let path = hover(&mut app, "song.flac");
-        assert_eq!(app.file_open(&path, "song.flac", false), FileOpen::Nothing);
+        assert_eq!(app.file_open(&path, "song.flac", &|_| false), FileOpen::Nothing);
         app.graphics = false;
         let path = hover(&mut app, "pic.png");
-        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Nothing);
+        assert_eq!(app.file_open(&path, "pic.png", &|_| true), FileOpen::Nothing);
         app.graphics = true;
 
         // Text opens in the editor; an unknown binary does nothing.
         let path = hover(&mut app, "t.txt");
-        assert_eq!(app.file_open(&path, "t.txt", false), FileOpen::Edit);
+        assert_eq!(app.file_open(&path, "t.txt", &|_| false), FileOpen::Edit);
         let path = hover(&mut app, "blob.dat");
-        assert_eq!(app.file_open(&path, "blob.dat", true), FileOpen::Nothing);
+        assert_eq!(app.file_open(&path, "blob.dat", &|_| true), FileOpen::Nothing);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Polls `file` until its lines satisfy `done`, or panics after 5 s.
+    #[cfg(unix)]
+    fn wait_lines(file: &Path, done: impl Fn(&[String]) -> bool) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            if done(&lines) {
+                return lines;
+            }
+            assert!(Instant::now() < deadline, "{}: {lines:?}", file.display());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vivid_previews_run_only_in_vivid_get_the_pane_origin_and_hide_under_overlays() {
+        let (mut app, d, out) = graphics_app("vivid");
+        // Records its arguments, then every stdin line, in the directory it runs in.
+        let script = r#"printf '%s\n' "$@" > args.log; while read -r l; do echo "$l" >> cmds.log; done"#;
+        app.cfg.previewers = vec![crate::config::PreviewerRule {
+            patterns: vec!["*.png".into()],
+            cmd: format!("sh -c '{}' sh", script.replace('\'', r#"'\''"#)),
+            graphics: false,
+            vivid: true,
+            interactive: true,
+        }];
+        app.set_term(term::Kind::Other, None);
+        drive_preview(&mut app);
+        assert!(!app.preview.is_vivid(), "a Vivid rule ran outside Vivid");
+
+        app.set_term(term::Kind::Vivid, None);
+        assert!(app.preview.is_vivid() && app.preview.is_interactive());
+        app.preview.tick(Instant::now());
+        // 120x30: a 59-col pane, its body 58 cols x 27 rows from column 62, row 2.
+        let args = wait_lines(&d.join("args.log"), |l| l.len() == 5);
+        assert_eq!(args[1..], ["58", "27", "62", "2"]);
+        assert!(args[0].ends_with("pic.png"), "{args:?}");
+        app.dirty = Dirty::Full;
+        app.render();
+        assert!(!out.take().contains('…'), "a running Vivid preview is not loading");
+
+        // Page turns while focused; hidden while help covers the pane.
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.handle_event(key('j'));
+        app.handle_event(special(KeyCode::Esc));
+        act(&mut app, Action::Help);
+        app.render();
+        act(&mut app, Action::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        app.render();
+        let cmds = wait_lines(&d.join("cmds.log"), |l| l.len() == 3);
+        assert_eq!(cmds, ["next", "hide", "show"]);
+
+        // A previewer that exits by itself shows its stderr's first line.
+        app.cfg.previewers[0].cmd = "sh -c 'echo; echo \"vivi: no picture\" >&2; exit 1' sh".into();
+        app.preview_supersede();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.preview.error().is_none() && Instant::now() < deadline {
+            app.preview.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.preview.error(), Some("vivi: no picture"));
+        app.preview.stop();
+        assert!(!app.preview.is_busy());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_in_vivid_opens_documents_in_vvrd_and_media_in_vivi() {
+        let d = tmpdir("openvivid");
+        std::fs::write(d.join("doc.pdf"), b"%PDF-1.4 noise").unwrap();
+        std::fs::write(d.join("README.md"), b"# hi\n").unwrap();
+        std::fs::write(d.join("pic.png"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(Config::default(), d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        app.term = term::Kind::Vivid;
+        app.graphics = true;
+        let open = |app: &App, name: &str, installed: &dyn Fn(&str) -> bool| {
+            app.file_open(&d.join(name), name, installed)
+        };
+        let all = |_: &str| true;
+        assert_eq!(open(&app, "doc.pdf", &all), FileOpen::Program("vvrd doc.pdf".into()));
+        assert_eq!(open(&app, "README.md", &all), FileOpen::Program("vvrd README.md".into()));
+        assert_eq!(open(&app, "pic.png", &all), FileOpen::Program("vivi --fullscreen pic.png".into()));
+        // Without the Vivid viewers, kitty graphics and the editor take over again.
+        let kitim = |p: &str| p == "kitim";
+        assert_eq!(open(&app, "pic.png", &kitim), FileOpen::Program("kitim --fullscreen pic.png".into()));
+        assert_eq!(open(&app, "README.md", &kitim), FileOpen::Edit);
+        // Outside Vivid the Vivid viewers are never used.
+        app.term = term::Kind::KittyGraphics;
+        // This fixture's head reads as text.
+        assert_eq!(open(&app, "doc.pdf", &all), FileOpen::Edit);
+        assert_eq!(open(&app, "pic.png", &all), FileOpen::Program("kitim --fullscreen pic.png".into()));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -3643,6 +3792,7 @@ mod tests {
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
             graphics: false,
+            vivid: false,
             interactive: false,
         }];
         let src = TestSource::new();

@@ -58,10 +58,12 @@ pub struct PreviewCfg {
     pub debounce_ms: u64,
     pub max_bytes: usize,
     /// The built-in kitim plugin: image and video previews, off by default.
+    /// In Vivid, vivi previews them instead.
     pub kitim: bool,
-    /// Videos previewed by the kitim plugin play their sound.
+    /// Videos previewed by the kitim (or vivi) plugin play their sound.
     pub kitim_sound: bool,
-    /// PDF and EPUB previews with page navigation through kitpdf.
+    /// PDF and EPUB previews with page navigation through kitpdf. In Vivid,
+    /// vvrd previews them instead, and SVG and Markdown files too.
     pub kitpdf: bool,
     /// Highlight text previews with bat when it is installed.
     pub bat: bool,
@@ -81,6 +83,10 @@ pub struct PreviewerRule {
     /// Prints kitty graphics frames, not text (see `graphics`). Only tried
     /// when the terminal answered the graphics probe.
     pub graphics: bool,
+    /// Draws through the Vivid side channel itself, at the pane's grid
+    /// position, so vfm appends that too. Only tried inside Vivid. Gets
+    /// `hide`/`show` lines on stdin while something covers the pane.
+    pub vivid: bool,
     /// Accepts next/prev/first/last lines on stdin while focused.
     pub interactive: bool,
 }
@@ -95,27 +101,50 @@ const KITIM_TYPES: &[&str] = &[
 /// Audio types kitim plays but can't preview: no picture to show.
 const KITIM_AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "alac", "aiff", "aif"];
 
-/// Whether Enter opens `name` in kitim: an image, video or audio extension,
-/// in any case. kitim itself decides if the terminal can show it.
+/// Documents vvrd reads, in Vivid: kitpdf's types plus SVG and Markdown.
+const VVRD_TYPES: &[&str] = &["pdf", "epub", "svg", "md", "markdown", "mkd"];
+
+/// Whether Enter opens `name` in kitim (or vivi, in Vivid): an image, video
+/// or audio extension, in any case. The viewer decides if it can show it.
 pub fn is_kitim_media(name: &str) -> bool {
+    has_extension(name, KITIM_TYPES.iter().chain(KITIM_AUDIO))
+}
+
+/// Whether Enter opens `name` in vvrd, in Vivid: a PDF, EPUB, SVG or
+/// Markdown extension, in any case.
+pub fn is_vvrd_document(name: &str) -> bool {
+    has_extension(name, VVRD_TYPES.iter())
+}
+
+fn has_extension<'a>(name: &str, mut types: impl Iterator<Item = &'a &'a str>) -> bool {
     // Path::extension treats ".png" as a hidden file with no extension.
     let Some(ext) = std::path::Path::new(name).extension().and_then(|e| e.to_str()) else {
         return false;
     };
     let ext = ext.to_ascii_lowercase();
-    KITIM_TYPES.iter().chain(KITIM_AUDIO).any(|t| ext == *t)
+    types.any(|t| ext == *t)
+}
+
+/// `*.ext` and `*.EXT` for each type: globs are case-sensitive.
+fn both_cases(types: &[&str]) -> Vec<String> {
+    types.iter().flat_map(|ext| [format!("*.{ext}"), format!("*.{}", ext.to_uppercase())]).collect()
 }
 
 /// The rule `[preview] kitim = true` adds: kitim's embedded preview mode,
 /// which takes the path, width and height vfm appends. With `sound`, videos
 /// play their audio.
 pub fn kitim_rule(sound: bool) -> PreviewerRule {
-    let patterns = KITIM_TYPES
-        .iter()
-        .flat_map(|ext| [format!("*.{ext}"), format!("*.{}", ext.to_uppercase())])
-        .collect();
     let cmd = if sound { "kitim --sound --preview" } else { "kitim --preview" };
-    PreviewerRule { patterns, cmd: cmd.into(), graphics: true, interactive: false }
+    let patterns = both_cases(KITIM_TYPES);
+    PreviewerRule { patterns, cmd: cmd.into(), graphics: true, vivid: false, interactive: false }
+}
+
+/// kitim's stand-in inside Vivid, added with it: vivi's pane mode, for
+/// the same types. It takes the pane's grid position after its size.
+pub fn vivi_rule(sound: bool) -> PreviewerRule {
+    let cmd = if sound { "vivi --sound --preview" } else { "vivi --preview" };
+    let patterns = both_cases(KITIM_TYPES);
+    PreviewerRule { patterns, cmd: cmd.into(), graphics: false, vivid: true, interactive: false }
 }
 
 /// The built-in PDF/EPUB previewer, enabled with `[preview] kitpdf = true`.
@@ -124,6 +153,19 @@ pub fn kitpdf_rule() -> PreviewerRule {
         patterns: ["*.pdf", "*.PDF", "*.epub", "*.EPUB"].map(String::from).into(),
         cmd: "kitpdf --preview".into(),
         graphics: true,
+        vivid: false,
+        interactive: true,
+    }
+}
+
+/// kitpdf's stand-in inside Vivid, added with it: vvrd's pane mode, which
+/// also reads SVG and Markdown.
+pub fn vvrd_rule() -> PreviewerRule {
+    PreviewerRule {
+        patterns: both_cases(VVRD_TYPES),
+        cmd: "vvrd --preview".into(),
+        graphics: false,
+        vivid: true,
         interactive: true,
     }
 }
@@ -303,20 +345,29 @@ impl Config {
                 }
                 let mut graphics = false;
                 get_bool(tbl, "graphics", &mut graphics);
+                let mut vivid = false;
+                get_bool(tbl, "vivid", &mut vivid);
                 let mut interactive = false;
                 get_bool(tbl, "interactive", &mut interactive);
-                if interactive && !graphics {
-                    errs.push("interactive previewers require graphics = true".into());
+                if graphics && vivid {
+                    errs.push("a previewer is either graphics = true or vivid = true".into());
                     continue;
                 }
-                self.previewers.push(PreviewerRule { patterns, cmd, graphics, interactive });
+                if interactive && !graphics && !vivid {
+                    errs.push("interactive previewers require graphics = true or vivid = true".into());
+                    continue;
+                }
+                self.previewers.push(PreviewerRule { patterns, cmd, graphics, vivid, interactive });
             }
         }
         // After the user's rules: first match wins, so theirs take precedence.
+        // Each Vivid rule precedes its kitty one, which Vivid also answers.
         if self.preview.kitim {
+            self.previewers.push(vivi_rule(self.preview.kitim_sound));
             self.previewers.push(kitim_rule(self.preview.kitim_sound));
         }
         if self.preview.kitpdf {
+            self.previewers.push(vvrd_rule());
             self.previewers.push(kitpdf_rule());
         }
         // [[opener]] definitions
@@ -613,11 +664,14 @@ graphics = true
         .parse()
         .unwrap();
         assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 2);
+        assert_eq!(cfg.previewers.len(), 3);
         assert_eq!(cfg.previewers[0].cmd, "my-viewer");
         assert!(cfg.previewers[0].graphics);
-        let kitim = &cfg.previewers[1];
-        assert_eq!((kitim.cmd.as_str(), kitim.graphics), ("kitim --preview", true));
+        let vivi = &cfg.previewers[1];
+        assert_eq!((vivi.cmd.as_str(), vivi.vivid, vivi.graphics), ("vivi --preview", true, false));
+        let kitim = &cfg.previewers[2];
+        assert_eq!((kitim.cmd.as_str(), kitim.graphics, kitim.vivid), ("kitim --preview", true, false));
+        assert_eq!(vivi.patterns, kitim.patterns);
         assert!(!cfg.preview.kitim_sound);
         for name in ["*.jpg", "*.JPG", "*.mp4", "*.MOV", "*.gif"] {
             assert!(kitim.patterns.iter().any(|p| p == name), "{name}");
@@ -630,6 +684,7 @@ graphics = true
         let t: toml::Table = "[preview]\nkitim = true\nkitim_sound = true\n".parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert_eq!(cfg.previewers.last().unwrap().cmd, "kitim --sound --preview");
+        assert_eq!(cfg.previewers[0].cmd, "vivi --sound --preview");
         // Without the plugin enabled, the sound switch adds nothing.
         let mut cfg = Config::default();
         let t: toml::Table = "[preview]\nkitim_sound = true\n".parse().unwrap();
@@ -653,14 +708,27 @@ interactive = true
         .parse()
         .unwrap();
         assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 2);
+        assert_eq!(cfg.previewers.len(), 3);
         assert_eq!(cfg.previewers[0].cmd, "custom --preview");
-        let rule = &cfg.previewers[1];
+        let vvrd = &cfg.previewers[1];
+        assert_eq!(vvrd.cmd, "vvrd --preview");
+        assert!(vvrd.vivid && vvrd.interactive && !vvrd.graphics);
+        for name in ["*.pdf", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.markdown"] {
+            assert!(vvrd.patterns.iter().any(|p| p == name), "{name}");
+        }
+        let rule = &cfg.previewers[2];
         assert_eq!(rule.cmd, "kitpdf --preview");
-        assert!(rule.graphics && rule.interactive);
+        assert!(rule.graphics && rule.interactive && !rule.vivid);
         assert_eq!(rule.patterns, ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]);
         let t: toml::Table = "[[previewer]]\nmatch=['*.pdf']\nrun='bad'\ninteractive=true".parse().unwrap();
         assert!(!Config::default().apply_table(&t).is_empty());
+        let t: toml::Table = "[[previewer]]\nmatch=['*.pdf']\nrun='both'\ngraphics=true\nvivid=true".parse().unwrap();
+        assert!(!Config::default().apply_table(&t).is_empty());
+        let mut cfg = Config::default();
+        let mine = "[[previewer]]\nmatch=['*.pdf']\nrun='mine'\nvivid=true\ninteractive=true";
+        let t: toml::Table = mine.parse().unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert!(cfg.previewers[0].vivid && cfg.previewers[0].interactive);
     }
 
     #[test]
@@ -695,6 +763,12 @@ run = "no patterns"
         }
         for name in ["x.txt", "png", "a.mp4x", "archive.tar.gz", ".png"] {
             assert!(!is_kitim_media(name), "{name}");
+        }
+        for name in ["a.PDF", "b.epub", "c.svg", "README.md", "notes.Markdown"] {
+            assert!(is_vvrd_document(name), "{name}");
+        }
+        for name in ["a.png", "x.txt", ".md", "svg"] {
+            assert!(!is_vvrd_document(name), "{name}");
         }
     }
 
