@@ -12,7 +12,7 @@ pub enum Action {
     // navigation
     Back,          // h / Left: parent dir
     Open,          // Enter: enter dir / open file
-    NavIn,         // l / Right: into dir only
+    NavIn,         // l / Right: enter dir or focus text preview
     Next,          // j / Down
     Prev,          // k / Up
     PgDn,

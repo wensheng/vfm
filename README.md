@@ -41,12 +41,20 @@ Press `?` inside vfm for the full key list. The essentials:
 | `n`, `C-r` | new file (trailing `/` = dir), rename |
 | `s`, `C-t`, `T` | cycle sort key, reverse sort, cycle time type |
 | `P` | toggle preview pane (terminal ≥ 100 columns) |
+| `Right` / `l` on a text file | focus the visible preview pane |
+| `Up` / `Down` while preview is focused | scroll preview by one displayed row |
+| `Page Down` / `C-f`, `Page Up` / `C-b` while preview is focused | scroll preview one page down / up |
+| `Esc` / `Left` while preview is focused | return focus to the file list |
 | `t` | tree view of the highlighted folder in the preview pane (needs `tree`) |
 | `;` | plugin menu |
 | `q`, `C-q`, `C-g` | close context, quit, quit and cd |
 
-`Esc` cancels a running file op, closes a plugin's preview, clears an active
-filter, or closes an overlay.
+The focused preview has a highlighted divider and a `FOCUSED` header. Scrolling
+stops at the beginning or end of the loaded preview; large previews remain
+subject to the configured byte limit. `Enter` still opens the file.
+
+`Esc` first leaves preview focus, otherwise cancels a running file op, closes
+a plugin's preview, clears an active filter, or closes an overlay.
 
 ### cd on quit
 

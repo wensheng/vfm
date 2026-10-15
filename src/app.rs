@@ -241,6 +241,10 @@ pub struct App {
     pub screen: Screen,
     pub events: Box<dyn EventSource>,
     pub preview: Preview,
+    /// Keyboard navigation currently scrolls the text preview.
+    preview_focused: bool,
+    /// Offset in wrapped display rows, not source lines.
+    preview_scroll: usize,
     pub mode: Mode,
     pub input: InputLine,
     /// Statusbar message with 3s expiry.
@@ -319,6 +323,8 @@ impl App {
             screen,
             events,
             preview,
+            preview_focused: false,
+            preview_scroll: 0,
             mode: Mode::Normal,
             input: InputLine::default(),
             msg: None,
@@ -502,6 +508,13 @@ impl App {
         if k.code == KeyCode::Esc {
             return Action::Esc;
         }
+        if self.preview_focused && matches!(self.mode, Mode::Normal) && ctrl {
+            match k.code {
+                KeyCode::Char('f' | 'F') => return Action::PgDn,
+                KeyCode::Char('b' | 'B') => return Action::PgUp,
+                _ => {}
+            }
+        }
         match self.mode {
             Mode::Confirm(_) => {
                 return match k.code {
@@ -562,6 +575,13 @@ impl App {
 
     fn apply_normal(&mut self, action: Action) -> Option<Flow> {
         self.dirty = Dirty::None;
+        if self.preview_focused {
+            if self.apply_preview(&action) {
+                return None;
+            }
+            self.preview_focused = false;
+            self.dirty = Dirty::Full;
+        }
         let rows = self.screen.list_rows() as isize;
         match action {
             Action::Next => self.move_cursor(1),
@@ -1061,6 +1081,22 @@ impl App {
             if let Some(p) = self.dir.hovered_path() {
                 self.cd(&p);
             }
+        } else if matches!(self.mode, Mode::Normal)
+            && self.preview_pane().is_some()
+            && self.preview_pin.is_none()
+            && self.preview.image().is_none()
+            && !self
+                .dir
+                .hovered_name()
+                .and_then(|n| self.match_previewer(n))
+                .is_some_and(|i| self.cfg.previewers[i].graphics)
+            && self
+                .dir
+                .hovered_path()
+                .is_some_and(|p| crate::preview::opens_as_text(&p))
+        {
+            self.preview_focused = true;
+            self.dirty = Dirty::Full;
         }
     }
 
@@ -1476,6 +1512,45 @@ impl App {
 
     // ---- preview plumbing
 
+    /// Consume navigation while the preview owns keyboard focus.
+    fn apply_preview(&mut self, action: &Action) -> bool {
+        let page = self.screen.list_rows();
+        let (down, amount) = match action {
+            Action::Next => (true, 1),
+            Action::Prev => (false, 1),
+            Action::PgDn => (true, page),
+            Action::PgUp => (false, page),
+            Action::HalfPgDn => (true, page / 2),
+            Action::HalfPgUp => (false, page / 2),
+            Action::Home => (false, usize::MAX),
+            Action::End => (true, usize::MAX),
+            Action::Esc | Action::Back => {
+                self.preview_focused = false;
+                self.dirty = Dirty::Full;
+                return true;
+            }
+            Action::NavIn | Action::Resize => return true,
+            _ => return false,
+        };
+        let Some((width, _)) = self.preview_pane() else {
+            return false;
+        };
+        let total = self.preview.lines().map_or(0, |(lines, _)| {
+            lines
+                .iter()
+                .map(|line| wrap_line(line, usize::from(width).saturating_sub(2)).len())
+                .sum::<usize>()
+        });
+        self.preview_scroll = if down {
+            self.preview_scroll.saturating_add(amount)
+        } else {
+            self.preview_scroll.saturating_sub(amount)
+        }
+        .min(total.saturating_sub(page));
+        self.dirty = Dirty::Full;
+        true
+    }
+
     fn preview_supersede(&mut self) {
         // Dir contents changed: the old sig can't match anymore — restart.
         if self.preview.enabled {
@@ -1495,6 +1570,8 @@ impl App {
     }
 
     fn preview_on_hover(&mut self) {
+        self.preview_focused = false;
+        self.preview_scroll = 0;
         if !self.preview.enabled {
             return;
         }
@@ -2028,9 +2105,10 @@ impl App {
         let theme = self.cfg.theme.clone();
         let h = self.screen.h;
         let x = (self.screen.w as usize).saturating_sub(pane_w);
+        let focus_style = if self.preview_focused { theme.cursor } else { theme.divider };
         // Divider.
         for r in 1..h.saturating_sub(1) {
-            self.screen.put_text(r, x.saturating_sub(1) as u16, "│", theme.divider, 1);
+            self.screen.put_text(r, x.saturating_sub(1) as u16, "│", focus_style, 1);
         }
         // Header: hovered name (or the pinned plugin and its dir) + state.
         let name = match self.preview_pin.and_then(|p| self.cfg.plugins.get(p.plugin)) {
@@ -2049,6 +2127,12 @@ impl App {
             Span { text: format!(" {name} "), style: theme.preview_meta },
             Span { text: state, style: theme.preview_meta },
         ]);
+        if self.preview_focused {
+            meta.spans.insert(
+                0,
+                Span { text: " [FOCUSED: Esc/Left exits] ".into(), style: theme.cursor },
+            );
+        }
         if let Some((_, truncated)) = self.preview.lines() {
             if truncated {
                 meta.spans.push(Span { text: " (truncated)".into(), style: theme.preview_meta });
@@ -2064,19 +2148,15 @@ impl App {
         let rows = self.screen.list_rows();
         let mut r = 2u16;
         if let Some((lines, _trunc)) = self.preview.lines() {
-            // Head of the output, like a pager: a file preview starts at line 1.
-            for line in lines {
+            let visible = lines
+                .iter()
+                .flat_map(|line| wrap_line(line, pane_w.saturating_sub(2)))
+                .skip(self.preview_scroll)
+                .take(rows);
+            for seg in visible {
                 // One column of padding after the divider.
-                for seg in wrap_line(line, pane_w.saturating_sub(2)) {
-                    self.screen.put_line_at(r, x as u16 + 1, &seg, pane_w - 1, Style::default());
-                    r += 1;
-                    if r as usize >= 2 + rows {
-                        break;
-                    }
-                }
-                if r as usize >= 2 + rows {
-                    break;
-                }
+                self.screen.put_line_at(r, x as u16 + 1, &seg, pane_w - 1, Style::default());
+                r += 1;
             }
         }
         let blank = Line::default();
@@ -2329,7 +2409,8 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "vfm — keys",
         "",
         "  j/k or arrows      move            h/Left       parent dir",
-        "  l/Right            enter dir       Enter        open (dir/media/text)",
+        "  l/Right            enter dir / focus text preview",
+        "  Enter              open (dir/media/text)",
         "  g / G              top / bottom    C-d / C-u    half page",
         "  J ±n               jump n rows     C-y          newest entry",
         "  '                  first file",
@@ -2344,6 +2425,8 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "  .                  show hidden     d            detail toggle",
         "  f                  file info       P            preview toggle",
         "  ?                  this help",
+        "  Focused preview:   Up/Down scroll, PgDn/C-f down, PgUp/C-b up",
+        "                     Esc/Left returns to the file list",
         "",
         "  Space              select + move   m m          range select",
         "  a / A              select all / invert    E     edit selection",
@@ -2930,7 +3013,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn drive_preview(app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.preview.is_busy() && Instant::now() < deadline {
@@ -2942,6 +3024,125 @@ mod tests {
     #[cfg(unix)]
     fn preview_texts(app: &App) -> Vec<String> {
         app.preview.lines().map(|(l, _)| l.iter().map(|l| l.text()).collect()).unwrap_or_default()
+    }
+
+    fn text_preview_app(name: &str, text: &str) -> (App, PathBuf) {
+        let (mut app, d) = test_app(name);
+        std::fs::write(d.join("alpha"), text).unwrap();
+        let index = app.dir.entries.iter().position(|e| &*e.name == "alpha").unwrap();
+        app.set_cursor(index);
+        app.preview.debounce = Duration::ZERO;
+        app.apply(Action::TogglePreview);
+        drive_preview(&mut app);
+        (app, d)
+    }
+
+    #[test]
+    fn focused_preview_routes_scroll_keys_and_returns_to_file_navigation() {
+        let text: String = (0..100).map(|i| format!("row {i:03}\n")).collect();
+        let (mut app, d) = text_preview_app("preview-focus-keys", &text);
+        let cursor = app.dir.cursor;
+        let path = app.dir.path.clone();
+        let page = app.screen.list_rows();
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        for (event, offset) in [
+            (special(KeyCode::Down), 1),
+            (special(KeyCode::Up), 0),
+            (special(KeyCode::PageDown), page),
+            (ckey('f'), page * 2),
+            (special(KeyCode::PageUp), page),
+            (ckey('b'), 0),
+            (special(KeyCode::Up), 0),
+        ] {
+            app.handle_event(event);
+            assert_eq!(app.preview_scroll, offset);
+            assert_eq!(app.dir.cursor, cursor);
+            assert_eq!(app.dir.path, path);
+        }
+        // Esc only releases focus, preserving an accepted filter/range.
+        app.ctx[app.ctx_i].filter_text = Some("a".into());
+        app.sel.range_anchor = Some(cursor);
+        for exit in [KeyCode::Esc, KeyCode::Left] {
+            app.handle_event(special(KeyCode::Right));
+            app.handle_event(special(KeyCode::PageDown));
+            app.handle_event(special(exit));
+            assert!(!app.preview_focused);
+            assert_eq!(app.dir.path, path);
+            assert_eq!(app.ctx[app.ctx_i].filter_text.as_deref(), Some("a"));
+            assert_eq!(app.sel.range_anchor, Some(cursor));
+            app.handle_event(special(KeyCode::Down));
+            assert_eq!(app.dir.cursor, cursor + 1);
+            assert_eq!(app.preview_scroll, 0);
+            app.handle_event(special(KeyCode::Up));
+            assert_eq!(app.dir.cursor, cursor);
+            drive_preview(&mut app);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn focused_preview_scrolls_wrapped_rows_and_renders_focus_indicator() {
+        // Width 120 gives a 59-column pane with 57 columns of text.
+        let text: String = (0..40).map(|i| format!("{:057}\n", i)).collect();
+        let text = format!("{}{}\n{text}", "A".repeat(57), "B".repeat(57));
+        let (mut app, d) = text_preview_app("preview-focus-render", &text);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.handle_event(special(KeyCode::Right));
+        app.render();
+        let frame = out.take();
+        assert!(frame.contains("[FOCUSED: Esc/Left exits]"));
+        assert!(frame.contains(&"A".repeat(57)));
+        app.handle_event(special(KeyCode::Down));
+        app.render();
+        let frame = out.take();
+        assert!(!frame.contains(&"A".repeat(57)));
+        assert!(frame.contains(&"B".repeat(57)));
+        for _ in 0..10 {
+            app.handle_event(special(KeyCode::PageDown));
+        }
+        assert_eq!(app.preview_scroll, 42 - app.screen.list_rows());
+        app.render();
+        assert!(out.take().contains(&format!("{:057}", 39)));
+        app.handle_event(special(KeyCode::Left));
+        app.render();
+        assert!(!out.take().contains("FOCUSED"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn focused_preview_handles_empty_text_resize_toggle_and_hidden_panes() {
+        let (mut app, d) = text_preview_app("preview-focus-lifecycle", "");
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.handle_event(ckey('f'));
+        assert_eq!(app.preview_scroll, 0);
+        app.handle_event(Event::Resize(80, 30));
+        assert!(!app.preview_focused);
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        app.handle_event(Event::Resize(120, 30));
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.apply(Action::TogglePreview);
+        assert!(!app.preview_focused && !app.preview.enabled);
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn preview_focus_preserves_directory_navigation_and_ignores_binary_files() {
+        let (mut app, d) = text_preview_app("preview-focus-targets", "\0binary");
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        let index = app.dir.entries.iter().position(|e| &*e.name == "subdir").unwrap();
+        app.set_cursor(index);
+        app.handle_event(special(KeyCode::Right));
+        assert!(!app.preview_focused);
+        assert_eq!(app.dir.path, std::fs::canonicalize(d.join("subdir")).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// An app on `pic.png` + `notes.txt`, with a graphics previewer for
