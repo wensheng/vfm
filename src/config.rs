@@ -126,18 +126,20 @@ pub struct PluginDef {
 /// Plugins vfm ships with. A `[[plugin]]` with the same `name` replaces one
 /// (e.g. to change its key, or `key = ""` to unbind it).
 fn default_plugins() -> Vec<PluginDef> {
-    // Windows ships its own tree.com with different flags (no colors).
-    let cmd = if cfg!(windows) {
-        r#"> if defined VFM_PATH (tree "%VFM_PATH%" /F /A) else (tree /F /A)"#
+    let (cmd, program) = if cfg!(windows) {
+        // Use Windows' tree.com even when PATH contains another tree tool.
+        let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+            .join("System32")
+            .join("tree.com")
+            .to_string_lossy()
+            .into_owned();
+        let cmd =
+            format!(r#"> if defined VFM_PATH ("{program}" "%VFM_PATH%" /F /A) else ("{program}" "%VFM_DIR%" /F /A)"#);
+        (cmd, program)
     } else {
-        r#"> tree -C --dirsfirst -L 3 "${VFM_PATH:-$VFM_DIR}""#
+        (r#"> tree -C --dirsfirst -L 3 "${VFM_PATH:-$VFM_DIR}""#.into(), "tree".into())
     };
-    vec![PluginDef {
-        name: "tree".into(),
-        cmd: cmd.into(),
-        key: Some("t".into()),
-        requires: vec!["tree".into()],
-    }]
+    vec![PluginDef { name: "tree".into(), cmd, key: Some("t".into()), requires: vec![program] }]
 }
 
 impl Default for Config {
@@ -533,7 +535,15 @@ dir = "cyan"
         let cfg = Config::default();
         let tree = cfg.plugins.iter().find(|p| p.name == "tree").unwrap();
         assert_eq!(tree.key.as_deref(), Some("t"));
+        #[cfg(unix)]
         assert_eq!(tree.requires, ["tree"]);
+        #[cfg(windows)]
+        {
+            assert_eq!(tree.requires.len(), 1);
+            assert!(PathBuf::from(&tree.requires[0]).is_absolute());
+            assert!(tree.requires[0].ends_with(r"\System32\tree.com"));
+            assert!(tree.cmd.contains(&format!(r#""{}""#, tree.requires[0])));
+        }
         assert!(tree.cmd.starts_with('>'));
 
         // Same name replaces the built-in (here: rebind + new command).

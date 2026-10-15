@@ -102,17 +102,31 @@ pub fn editor() -> String {
 /// Environment contract for plugin/previewer children.
 pub fn child_env(dir: &Path, hovered: Option<&Path>, sel_file: Option<&Path>, ctx: u8) -> Vec<(String, String)> {
     let mut env = vec![
-        ("VFM_DIR".to_string(), dir.to_string_lossy().into_owned()),
+        ("VFM_DIR".to_string(), child_path(dir)),
         ("VFM_CTX".to_string(), ctx.to_string()),
         ("VFM_VERSION".to_string(), crate::config::VERSION.to_string()),
     ];
     if let Some(p) = hovered {
-        env.push(("VFM_PATH".to_string(), p.to_string_lossy().into_owned()));
+        env.push(("VFM_PATH".to_string(), child_path(p)));
     }
     if let Some(f) = sel_file {
-        env.push(("VFM_SELFILE".to_string(), f.to_string_lossy().into_owned()));
+        env.push(("VFM_SELFILE".to_string(), child_path(f)));
     }
     env
+}
+
+fn child_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        // canonicalize adds verbatim prefixes that legacy tools like tree.com reject.
+        match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(_) => return text.trim_start_matches(r"\\?\").to_owned(),
+            std::path::Prefix::VerbatimUNC(_, _) => return format!(r"\\{}", text.trim_start_matches(r"\\?\UNC\")),
+            _ => {}
+        }
+    }
+    text.into_owned()
 }
 
 pub fn shell_command(cmdline: &str, cwd: &Path, env: &[(String, String)]) -> Command {
@@ -124,6 +138,8 @@ pub fn shell_command(cmdline: &str, cwd: &Path, env: &[(String, String)]) -> Com
     };
     #[cfg(windows)]
     let mut c = {
+        use std::os::windows::process::CommandExt;
+
         let line = cmdline.to_string();
         if line.ends_with(".ps1") {
             let mut c = Command::new("powershell");
@@ -131,7 +147,9 @@ pub fn shell_command(cmdline: &str, cwd: &Path, env: &[(String, String)]) -> Com
             c
         } else {
             let mut c = Command::new(shell());
-            c.arg("/C").arg(&line);
+            // cmd needs literal shell syntax, not C-style escaped argv quotes.
+            // /S strips the outer quotes while preserving quotes within the command.
+            c.args(["/D", "/S", "/C"]).raw_arg(format!(r#""{line}""#));
             c
         }
     };
@@ -251,6 +269,39 @@ mod tests {
         assert!(env.contains(&("VFM_SELFILE".into(), "/sel".into())));
         assert!(env.contains(&("VFM_CTX".into(), "3".into())));
         assert!(child_env(Path::new("/w"), None, None, 0).iter().all(|(k, _)| k != "VFM_PATH"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_env_uses_standard_windows_paths() {
+        let env = child_env(
+            Path::new(r"\\?\F:\some dir"),
+            Some(Path::new(r"\\?\F:\some dir\folder")),
+            Some(Path::new(r"\\?\UNC\server\share\selection")),
+            0,
+        );
+        assert!(env.contains(&("VFM_DIR".into(), r"F:\some dir".into())));
+        assert!(env.contains(&("VFM_PATH".into(), r"F:\some dir\folder".into())));
+        assert!(env.contains(&("VFM_SELFILE".into(), r"\\server\share\selection".into())));
+        let env = child_env(Path::new(r"\\server\share\folder"), Some(Path::new(r"C:\folder")), None, 0);
+        assert!(env.contains(&("VFM_DIR".into(), r"\\server\share\folder".into())));
+        assert!(env.contains(&("VFM_PATH".into(), r"C:\folder".into())));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builtin_tree_runs_without_path() {
+        let cfg = crate::config::Config::default();
+        let tree = cfg.plugins.iter().find(|p| p.name == "tree").unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").canonicalize().unwrap();
+        let env = child_env(&dir, Some(&dir), None, 0);
+        let (_, cmdline) = resolve_mode(&tree.cmd);
+        let out = shell_command(cmdline, &dir, &env).env("PATH", "").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("main.rs"), "{stdout}");
+        assert!(stderr.is_empty(), "{stderr}");
     }
 
     #[cfg(unix)]

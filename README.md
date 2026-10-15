@@ -45,7 +45,7 @@ Press `?` inside vfm for the full key list. The essentials:
 | `Up` / `Down` while preview is focused | scroll preview by one displayed row |
 | `Page Down` / `C-f`, `Page Up` / `C-b` while preview is focused | scroll preview one page down / up |
 | `Esc` / `Left` while preview is focused | return focus to the file list |
-| `t` | tree view of the highlighted folder in the preview pane (needs `tree`) |
+| `t` | tree view of the highlighted folder in the preview pane (needs `tree` on Unix; built into Windows) |
 | `;` | plugin menu |
 | `q`, `C-q`, `C-g` | close context, quit, quit and cd |
 
@@ -245,8 +245,10 @@ the key (`key = ""` unbinds it). A key you assign in `[keys]` always takes
 precedence over a plugin's key.
 
 The tree starts at the highlighted folder. If the listing is empty, it uses the
-current directory. On Windows, the built-in command is
-`> if defined VFM_PATH (tree "%VFM_PATH%" /F /A) else (tree /F /A)`.
+current directory. On Windows, vfm uses `%SystemRoot%\System32\tree.com` directly
+(normally `C:\Windows\System32\tree.com`) with `/F /A`, regardless of `PATH`.
+Paths passed in the plugin environment use standard drive/UNC notation instead
+of Rust's canonical `\\?\` prefix, which Windows tree does not accept.
 
 ### Environment and control lines
 
