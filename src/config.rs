@@ -67,6 +67,8 @@ pub struct PreviewCfg {
     pub kitpdf: bool,
     /// Highlight text previews with bat when it is installed.
     pub bat: bool,
+    /// Show line numbers in bat text previews.
+    pub line_numbers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +222,7 @@ impl Default for Config {
                 kitim_sound: false,
                 kitpdf: false,
                 bat: true,
+                line_numbers: true,
             },
             theme: Theme::default(),
             previewers: Vec::new(),
@@ -324,6 +327,7 @@ impl Config {
             get_bool(p, "kitim_sound", &mut self.preview.kitim_sound);
             get_bool(p, "kitpdf", &mut self.preview.kitpdf);
             get_bool(p, "bat", &mut self.preview.bat);
+            get_bool(p, "line_numbers", &mut self.preview.line_numbers);
         }
         // [[previewer]] rules
         if let Some(rules) = t.get("previewer").and_then(|v| v.as_array()) {
@@ -738,6 +742,18 @@ interactive = true
         let t: toml::Table = "[preview]\nbat = false\n".parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert!(!cfg.preview.bat);
+    }
+
+    #[test]
+    fn preview_line_numbers_default_on_and_follow_config() {
+        let mut cfg = Config::default();
+        assert!(cfg.preview.line_numbers);
+        for enabled in [false, true] {
+            let t: toml::Table = format!("[preview]\nline_numbers = {enabled}\n").parse().unwrap();
+            assert!(cfg.apply_table(&t).is_empty());
+            assert_eq!(cfg.preview.line_numbers, enabled);
+            assert!(cfg.preview.bat);
+        }
     }
 
     #[test]

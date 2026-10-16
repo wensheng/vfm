@@ -311,7 +311,7 @@ impl App {
             cfg.preview.max_bytes,
         );
         preview.enabled = cfg.ui.preview && cfg.preview.enabled;
-        preview.highlight = crate::preview::bat_argv(cfg.preview.bat, plugin::which);
+        preview.highlight = crate::preview::bat_argv(cfg.preview.bat, cfg.preview.line_numbers, plugin::which);
         let mut app = App {
             detail: cfg.ui.detail,
             ctx_active: 1,
@@ -3149,6 +3149,53 @@ mod tests {
             drive_preview(&mut app);
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focused_highlighted_preview_scrolls_through_multiple_pages() {
+        let text: String = (0..200).map(|i| format!("row {i:03}\n")).collect();
+        let (mut app, d) = test_app("preview-highlight-scroll");
+        std::fs::write(d.join("alpha"), format!("{text}last row\n")).unwrap();
+        let index = app.dir.entries.iter().position(|e| &*e.name == "alpha").unwrap();
+        app.set_cursor(index);
+        // Emulate bat's line range without depending on an installed highlighter.
+        let script = r#"head -n "${1##*:}" "$3""#;
+        app.preview.highlight = Some(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
+        app.preview.debounce = Duration::ZERO;
+        app.apply(Action::TogglePreview);
+        drive_preview(&mut app);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        let cursor = app.dir.cursor;
+        let path = app.dir.path.clone();
+        let page = app.screen.list_rows();
+        app.handle_event(special(KeyCode::Right));
+        for i in 1..=3 {
+            app.handle_event(ckey('f'));
+            assert_eq!(app.preview_scroll, i * page);
+            app.render();
+            assert!(out.take().contains(&format!("row {:03}", i * page)));
+        }
+        for i in 1..=page + 5 {
+            app.handle_event(special(KeyCode::Down));
+            assert_eq!(app.preview_scroll, 3 * page + i);
+        }
+        app.handle_event(special(KeyCode::End));
+        app.render();
+        assert!(out.take().contains("last row"));
+        let end = app.preview_scroll;
+        app.handle_event(ckey('f'));
+        app.handle_event(special(KeyCode::Down));
+        assert_eq!(app.preview_scroll, end);
+        app.handle_event(ckey('b'));
+        assert_eq!(app.preview_scroll, end - page);
+        app.handle_event(special(KeyCode::Home));
+        assert_eq!(app.preview_scroll, 0);
+        assert!(app.preview_focused);
+        assert_eq!(app.dir.cursor, cursor);
+        assert_eq!(app.dir.path, path);
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

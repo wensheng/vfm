@@ -103,6 +103,7 @@ kitim       = false       # image/video previews via kitim, or vivi in Vivido (s
 kitim_sound = false       # and play videos' sound in those previews
 kitpdf      = false       # PDF/EPUB previews with page navigation; vvrd in Vivido adds SVG, Markdown
 bat         = true        # highlight text previews with bat (or batcat), if installed
+line_numbers = true       # use bat -n; false uses bat -p without line numbers
 
 [colors]                  # name, 0-255, or 0xRRGGBB
 dir = "blue"
@@ -152,9 +153,10 @@ colors independently of icons.
 SGR colors and strips other escape sequences. With no matching rule, a built-in
 preview shows text heads, directory listings, symlink targets, and binary file
 types. If [bat](https://github.com/sharkdp/bat) is installed (as `bat` or
-`batcat`), text heads are syntax-highlighted through it; `bat = false` under
-`[preview]` keeps them plain. Moving the cursor kills a slow previewer
-immediately; recent results are cached.
+`batcat`), text previews are syntax-highlighted with line numbers (`bat -n`)
+by default. Set `line_numbers = false` under `[preview]` to hide the numbers
+(`bat -p`), or `bat = false` to use the built-in plain preview. Moving the cursor
+kills a slow previewer immediately; recent results are cached.
 
 ### Graphics previewers
 

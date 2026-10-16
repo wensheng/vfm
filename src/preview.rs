@@ -28,6 +28,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
+/// Bound retained text and highlighting work while allowing focused scrolling.
 const MAX_LINES: usize = 20_000;
 
 /// How long a superseded Vivid previewer gets to tear down after its stdin
@@ -49,15 +50,17 @@ const SNIFF_BYTES: usize = 8192;
 /// Ubuntu install bat as `batcat`.
 const BAT_NAMES: [&str; 2] = ["bat", "batcat"];
 
-/// bat flags for a pane: colors through the pipe, no decorations, no pager,
-/// and no wrapping, since the pane wraps lines itself.
-const BAT_FLAGS: [&str; 4] = ["--color=always", "--style=plain", "--paging=never", "--wrap=never"];
+/// Keep colors and requested decorations through the pipe, with no pager
+/// or wrapping, since the pane wraps lines itself.
+const BAT_FLAGS: [&str; 4] = ["--color=always", "--decorations=always", "--paging=never", "--wrap=never"];
 
 /// The highlighter argv for text previews: bat, if `enabled` and
-/// `installed` finds it under one of its names.
-pub fn bat_argv(enabled: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+/// `installed` finds it under one of its names. `line_numbers` selects
+/// numbered (`-n`) or plain (`-p`) output.
+pub fn bat_argv(enabled: bool, line_numbers: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
     let prog = BAT_NAMES.into_iter().filter(|_| enabled).find(|name| installed(name))?;
-    Some(std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect())
+    let style = if line_numbers { "-n" } else { "-p" };
+    Some(std::iter::once(prog).chain(BAT_FLAGS).chain([style]).map(String::from).collect())
 }
 
 // ---------------------------------------------------------------- signature
@@ -673,8 +676,8 @@ impl Preview {
 impl Preview {
     /// The highlighter command for `path` if it is a readable text file.
     /// Binary files stay built-in: bat passes them through when piped.
-    /// Only lines that can show are asked for, since highlighting a large
-    /// file whole takes seconds.
+    /// Load beyond the initial pane for focused scrolling, but bound the
+    /// highlighting work. One extra line lets the reader detect truncation.
     fn highlighter(&self, path: &Path) -> Option<Command> {
         let (prog, flags) = self.highlight.as_ref()?.split_first()?;
         if !is_text_file(path) {
@@ -682,7 +685,7 @@ impl Preview {
         }
         let mut c = Command::new(prog);
         c.args(flags)
-            .arg(format!("--line-range=:{}", self.pane.1.max(1)))
+            .arg(format!("--line-range=:{}", MAX_LINES + 1))
             .arg("--")
             .arg(path)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
@@ -1035,19 +1038,43 @@ mod tests {
             pv.lines().unwrap().0.iter().map(|l| l.text()).collect::<Vec<_>>()
         };
         let path = d.join("t.rs").display().to_string();
-        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:24 -- {path}")]);
+        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:{} -- {path}", MAX_LINES + 1)]);
         assert_eq!(show("bin.dat", 2)[0], "binary: PNG image");
         assert!(show("sub", 3).is_empty(), "empty dir listing");
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn highlighted_preview_marks_the_line_limit_as_truncated() {
+        let d = tmpdir("highlight-limit");
+        let path = d.join("large.txt");
+        std::fs::write(&path, "x\n".repeat(MAX_LINES + 2)).unwrap();
+        let mut pv = Preview::new(Duration::ZERO, 256 * 1024);
+        pv.set_context((40, 24), Vec::new(), &d);
+        let script = r#"head -n "${1##*:}" "$3""#;
+        pv.highlight = Some(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
+        pv.request(Target { path, source: Source::Builtin, sig: 1 }, Instant::now());
+        run_to_done(&mut pv);
+        let (lines, truncated) = pv.lines().unwrap();
+        assert_eq!(lines.len(), MAX_LINES);
+        assert!(truncated);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn bat_is_found_under_either_name_unless_disabled() {
-        let flags = |prog: &str| std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect::<Vec<_>>();
-        assert_eq!(bat_argv(true, |p| p == "bat"), Some(flags("bat")));
-        assert_eq!(bat_argv(true, |p| p == "batcat"), Some(flags("batcat")));
-        assert_eq!(bat_argv(true, |_| false), None);
-        assert_eq!(bat_argv(false, |_| true), None);
+        for (line_numbers, style) in [(true, "-n"), (false, "-p")] {
+            let flags = |prog: &str| {
+                [prog, "--color=always", "--decorations=always", "--paging=never", "--wrap=never", style]
+                    .map(String::from)
+                    .to_vec()
+            };
+            assert_eq!(bat_argv(true, line_numbers, |p| p == "bat"), Some(flags("bat")));
+            assert_eq!(bat_argv(true, line_numbers, |p| p == "batcat"), Some(flags("batcat")));
+            assert_eq!(bat_argv(true, line_numbers, |_| false), None);
+            assert_eq!(bat_argv(false, line_numbers, |_| true), None);
+        }
     }
 
     #[test]
