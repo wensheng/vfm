@@ -65,9 +65,10 @@ pub fn bat_argv(enabled: bool, line_numbers: bool, installed: impl Fn(&str) -> b
 
 // ---------------------------------------------------------------- signature
 
-/// FNV-1a over path bytes, size, mtime, pane size and rule id — identical
+/// FNV-1a over path bytes, size, mtime, layout and rule id — identical
 /// signature means "already showing this content" (yazi PreviewSig).
-pub fn make_sig(path: &Path, size: u64, mtime: i64, pane: (u16, u16), rule: usize) -> u64 {
+/// `layout` lists the screen and pane sizes the output depends on.
+pub fn make_sig(path: &Path, size: u64, mtime: i64, layout: &[u16], rule: usize) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: &[u8]| {
         for &byte in b {
@@ -78,8 +79,9 @@ pub fn make_sig(path: &Path, size: u64, mtime: i64, pane: (u16, u16), rule: usiz
     mix(path.as_os_str().as_encoded_bytes());
     mix(&size.to_le_bytes());
     mix(&mtime.to_le_bytes());
-    mix(&pane.0.to_le_bytes());
-    mix(&pane.1.to_le_bytes());
+    for n in layout {
+        mix(&n.to_le_bytes());
+    }
     mix(&rule.to_le_bytes());
     h
 }
@@ -924,13 +926,14 @@ mod tests {
     #[test]
     fn sig_changes_with_inputs() {
         let p = Path::new("/tmp/x");
-        let base = make_sig(p, 10, 20, (80, 24), 0);
-        assert_eq!(base, make_sig(p, 10, 20, (80, 24), 0));
-        assert_ne!(base, make_sig(p, 11, 20, (80, 24), 0));
-        assert_ne!(base, make_sig(p, 10, 21, (80, 24), 0));
-        assert_ne!(base, make_sig(p, 10, 20, (79, 24), 0));
-        assert_ne!(base, make_sig(p, 10, 20, (80, 24), 1));
-        assert_ne!(base, make_sig(Path::new("/tmp/y"), 10, 20, (80, 24), 0));
+        let base = make_sig(p, 10, 20, &[80, 24], 0);
+        assert_eq!(base, make_sig(p, 10, 20, &[80, 24], 0));
+        assert_ne!(base, make_sig(p, 11, 20, &[80, 24], 0));
+        assert_ne!(base, make_sig(p, 10, 21, &[80, 24], 0));
+        assert_ne!(base, make_sig(p, 10, 20, &[79, 24], 0));
+        assert_ne!(base, make_sig(p, 10, 20, &[80, 24, 39], 0));
+        assert_ne!(base, make_sig(p, 10, 20, &[80, 24], 1));
+        assert_ne!(base, make_sig(Path::new("/tmp/y"), 10, 20, &[80, 24], 0));
     }
 
     #[cfg(unix)]
@@ -1093,8 +1096,7 @@ mod tests {
         let d = tmpdir("state");
         let path = d.join("f.txt");
         std::fs::write(&path, b"hello\n").unwrap();
-        let pane = (80u16, 24u16);
-        let sig = make_sig(&path, 6, 1, pane, 0);
+        let sig = make_sig(&path, 6, 1, &[80, 24], 0);
 
         let t0 = Instant::now();
         pv.request(Target { path: path.clone(), source: Source::Builtin, sig }, t0);

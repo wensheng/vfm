@@ -34,6 +34,8 @@ pub struct UiCfg {
     /// Show file icons when the terminal is configured with a Nerd Font.
     pub nerd_font: bool,
     pub preview: bool,
+    /// The preview pane's share of the terminal width, in percent.
+    pub preview_width: u16,
     pub wrap_nav: bool,
     pub scrolloff: usize,
     pub time_type: crate::util::TimeType,
@@ -208,6 +210,7 @@ impl Default for Config {
                 detail: true,
                 nerd_font: false,
                 preview: false,
+                preview_width: 50,
                 wrap_nav: true,
                 scrolloff: crate::dir::SCROLLOFF,
                 time_type: crate::util::TimeType::Modified,
@@ -288,6 +291,9 @@ impl Config {
             get_bool(ui, "wrap_nav", &mut self.ui.wrap_nav);
             if let Some(v) = ui.get("scrolloff").and_then(|v| v.as_integer()) {
                 self.ui.scrolloff = v.clamp(0, 10) as usize;
+            }
+            if let Some(v) = ui.get("preview_width").and_then(|v| v.as_integer()) {
+                self.ui.preview_width = v.clamp(10, 90) as u16;
             }
             if let Some(v) = ui.get("time_type").and_then(|v| v.as_str()) {
                 self.ui.time_type = match v {
@@ -608,6 +614,17 @@ dir = "cyan"
         assert_eq!(cfg.plugins.last().unwrap().name, "git status");
         assert_eq!(cfg.keys, vec![("quit".to_string(), "Q".to_string())]);
         assert_eq!(cfg.theme.dir.fg, Color::Idx(6));
+    }
+
+    #[test]
+    fn preview_width_defaults_to_half_and_is_clamped() {
+        assert_eq!(Config::default().ui.preview_width, 50);
+        for (value, want) in [(35, 35), (0, 10), (-4, 10), (95, 90)] {
+            let mut cfg = Config::default();
+            let t = format!("[ui]\npreview_width = {value}\n").parse().unwrap();
+            assert!(cfg.apply_table(&t).is_empty());
+            assert_eq!(cfg.ui.preview_width, want, "preview_width = {value}");
+        }
     }
 
     #[test]

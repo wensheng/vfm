@@ -44,6 +44,7 @@ Press `?` inside vfm for the full key list. The essentials:
 | `n`, `C-r` | new file (trailing `/` = dir), rename |
 | `s`, `C-t`, `T` | cycle sort key, reverse sort, cycle time type |
 | `P` | toggle preview pane (terminal ≥ 100 columns) |
+| `<` / `>`, or drag the divider | move the preview divider left / right (widen / narrow the preview) |
 | `Right` / `l` on a text file | focus the visible preview pane |
 | `Up` / `Down` while preview is focused | scroll preview by one displayed row |
 | `Page Down` / `C-f`, `Page Up` / `C-b` while preview is focused | scroll preview one page down / up |
@@ -58,6 +59,14 @@ subject to the configured byte limit. `Enter` still opens the file.
 
 `Esc` first leaves preview focus, otherwise cancels a running file op, closes
 a plugin's preview, clears an active filter, or closes an overlay.
+
+`<` and `>` move the divider by 5% of the terminal width; dragging it with
+the mouse moves it to the pointer. Either side keeps at least 20 columns, and
+the split is kept as a share of the width when the terminal resizes. Text
+rewraps as the divider moves; previewers that size their output to the pane,
+such as image previews, rerun when the drag ends. Resizing keeps a focused
+preview focused. `[ui] preview_width` sets the starting split, and `[keys]`
+can rebind `preview_wider` and `preview_narrower`.
 
 ### cd on quit
 
@@ -82,6 +91,7 @@ show_hidden = false
 detail      = true        # perms/date/size columns
 nerd_font   = false       # file icons; enable with a Nerd Font in your terminal
 preview     = false       # preview pane on at startup
+preview_width = 50        # preview pane's share of the width, in percent (10-90)
 wrap_nav    = true        # j on the last entry wraps to the first
 scrolloff   = 3
 time_type   = "modified"  # modified | accessed | created

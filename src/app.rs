@@ -90,6 +90,13 @@ pub struct Pin {
 /// would cap it at 33 fps and add judder to 24 and 30 fps video.
 const ANIMATION_TICK: Duration = Duration::from_millis(15);
 
+/// Narrowest the file list or the preview pane gets, in columns, however
+/// far the divider moves, so neither pane is dragged out of sight.
+const MIN_SIDE_COLS: u16 = 20;
+
+/// `<` / `>` steps across the screen width: 5% per press.
+const DIVIDER_STEPS: u16 = 20;
+
 /// The preview image on screen: which frame, where, and its id for deleting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Shown {
@@ -245,6 +252,11 @@ pub struct App {
     preview_focused: bool,
     /// Offset in wrapped display rows, not source lines.
     preview_scroll: usize,
+    /// The preview's share of the screen width, divider included, in
+    /// thousandths: fine enough that a drag lands on the exact column.
+    preview_share: u16,
+    /// The left button went down on the preview divider and is still held.
+    dragging: bool,
     pub mode: Mode,
     pub input: InputLine,
     /// Statusbar message with 3s expiry.
@@ -312,6 +324,7 @@ impl App {
         );
         preview.enabled = cfg.ui.preview && cfg.preview.enabled;
         preview.highlight = crate::preview::bat_argv(cfg.preview.bat, cfg.preview.line_numbers, plugin::which);
+        let preview_share = cfg.ui.preview_width * 10; // percent → thousandths
         let mut app = App {
             detail: cfg.ui.detail,
             ctx_active: 1,
@@ -325,6 +338,8 @@ impl App {
             preview,
             preview_focused: false,
             preview_scroll: 0,
+            preview_share,
+            dragging: false,
             mode: Mode::Normal,
             input: InputLine::default(),
             msg: None,
@@ -560,6 +575,11 @@ impl App {
     fn mouse_action(&mut self, m: MouseEvent) -> Action {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // A press on the divider starts a drag, never half a double click.
+                if self.on_divider(m.row, m.column) {
+                    self.last_click = None;
+                    return Action::Click { row: m.row, col: m.column, kind: ClickKind::Single };
+                }
                 let now = Instant::now();
                 let double = self
                     .last_click
@@ -576,7 +596,9 @@ impl App {
             }
             MouseEventKind::ScrollUp => Action::Click { row: m.row, col: m.column, kind: ClickKind::WheelUp },
             MouseEventKind::ScrollDown => Action::Click { row: m.row, col: m.column, kind: ClickKind::WheelDown },
-            _ => Action::Resize, // Drag/Up/Moved: ignored; Resize = no-op action
+            MouseEventKind::Drag(MouseButton::Left) => Action::Click { row: m.row, col: m.column, kind: ClickKind::Drag },
+            MouseEventKind::Up(MouseButton::Left) => Action::Click { row: m.row, col: m.column, kind: ClickKind::Release },
+            _ => Action::Resize, // Moved, other buttons: ignored; Resize = no-op action
         }
     }
 
@@ -699,6 +721,8 @@ impl App {
                 }
                 self.dirty = Dirty::Full;
             }
+            Action::PreviewWider => self.step_divider(true),
+            Action::PreviewNarrower => self.step_divider(false),
             Action::AutoNext => {
                 self.auto_next = !self.auto_next;
                 self.notify(format!("auto-advance {}", on_off(self.auto_next)));
@@ -863,6 +887,10 @@ impl App {
             Action::PgUp => self.move_cursor(-(self.screen.list_rows() as isize)),
             Action::Home => self.set_cursor(0),
             Action::End => self.set_cursor(self.dir.nvisible().saturating_sub(1)),
+            // The divider can be dragged while filtering too.
+            Action::Click { row, col, kind: kind @ (ClickKind::Single | ClickKind::Drag | ClickKind::Release) } => {
+                self.on_click(row, col, kind)
+            }
             Action::Click { row, .. } => self.on_click(row, 0, ClickKind::Single),
             Action::Quit => return Some(Flow::Quit(0)),
             _ => {}
@@ -1574,10 +1602,38 @@ impl App {
                 return true;
             }
             Action::NavIn | Action::Resize => return true,
+            // Moving the divider keeps the focus. Drags and releases only
+            // ever act on the divider, so they never take the focus away.
+            Action::PreviewWider | Action::PreviewNarrower => {
+                self.step_divider(*action == Action::PreviewWider);
+                return true;
+            }
+            &Action::Click { row, col, kind }
+                if matches!(kind, ClickKind::Drag | ClickKind::Release)
+                    || (kind == ClickKind::Single && self.on_divider(row, col)) =>
+            {
+                self.on_click(row, col, kind);
+                return true;
+            }
             _ => return false,
         };
-        let Some((width, _)) = self.preview_pane() else {
+        if self.preview_pane().is_none() {
             return false;
+        }
+        self.preview_scroll = if down {
+            self.preview_scroll.saturating_add(amount)
+        } else {
+            self.preview_scroll.saturating_sub(amount)
+        }
+        .min(self.preview_max_scroll());
+        self.dirty = Dirty::Full;
+        true
+    }
+
+    /// Furthest the preview scrolls: its wrapped rows less one page.
+    fn preview_max_scroll(&self) -> usize {
+        let Some((width, _)) = self.preview_pane() else {
+            return 0;
         };
         let total = self.preview.lines().map_or(0, |(lines, _)| {
             lines
@@ -1585,14 +1641,7 @@ impl App {
                 .map(|line| wrap_line(line, usize::from(width).saturating_sub(2)).len())
                 .sum::<usize>()
         });
-        self.preview_scroll = if down {
-            self.preview_scroll.saturating_add(amount)
-        } else {
-            self.preview_scroll.saturating_sub(amount)
-        }
-        .min(total.saturating_sub(page));
-        self.dirty = Dirty::Full;
-        true
+        total.saturating_sub(self.screen.list_rows())
     }
 
     fn preview_supersede(&mut self) {
@@ -1608,14 +1657,69 @@ impl App {
         self.screen.w >= 100 && self.screen.h >= 10
     }
 
+    /// The preview pane's width right of the divider, and its height, when
+    /// the pane is showing.
     fn preview_pane(&self) -> Option<(u16, u16)> {
         let (w, h) = (self.screen.w, self.screen.h);
-        (self.preview.enabled && self.pane_fits()).then(|| (w / 2 - 1, h.saturating_sub(4)))
+        (self.preview.enabled && self.pane_fits())
+            .then(|| (w.saturating_sub(divider_col(w, self.preview_share) + 1), h.saturating_sub(4)))
+    }
+
+    /// The screen column of the divider, when the pane is showing.
+    fn divider(&self) -> Option<u16> {
+        self.preview_pane().map(|(pane_w, _)| self.screen.w - pane_w - 1)
+    }
+
+    /// A press at `(row, col)` grabs the divider: the divider itself or the
+    /// blank column after it, in a mode that shows the pane.
+    fn on_divider(&self, row: u16, col: u16) -> bool {
+        let Some(divider) = self.divider() else { return false };
+        matches!(self.mode, Mode::Normal | Mode::Filter)
+            && (1..self.screen.h.saturating_sub(1)).contains(&row)
+            && (divider..=divider + 1).contains(&col)
+    }
+
+    /// Moves the divider to `col`, as far as both panes keep their minimum
+    /// width. Previewers rerun once it settles, not on every step of a drag.
+    fn move_divider(&mut self, col: u16) {
+        let w = self.screen.w;
+        let col = clamp_divider(w, col);
+        if self.divider().is_some_and(|d| d != col) {
+            self.preview_share = share_at(w, col);
+            self.dirty = Dirty::Full;
+        }
+    }
+
+    /// `<` / `>`: moves the divider one step left (wider preview) or right.
+    fn step_divider(&mut self, wider: bool) {
+        let Some(divider) = self.divider() else {
+            self.notify("no preview pane");
+            return;
+        };
+        let step = (self.screen.w / DIVIDER_STEPS).max(1);
+        self.move_divider(if wider { divider.saturating_sub(step) } else { divider + step });
+        self.settle_divider();
+    }
+
+    /// The divider stopped: keep the scroll within the rewrapped text, and
+    /// rerun previewers whose output depends on the pane size.
+    fn settle_divider(&mut self) {
+        if self.preview_scroll > 0 {
+            self.preview_scroll = self.preview_scroll.min(self.preview_max_scroll());
+        }
+        self.request_preview();
+        self.dirty = Dirty::Full;
     }
 
     fn preview_on_hover(&mut self) {
         self.preview_focused = false;
         self.preview_scroll = 0;
+        self.request_preview();
+    }
+
+    /// Asks for the hovered entry's preview (or the pinned plugin's output)
+    /// at the current pane size. A no-op while that is already showing.
+    fn request_preview(&mut self) {
         if !self.preview.enabled {
             return;
         }
@@ -1631,8 +1735,12 @@ impl App {
         let Some(path) = self.dir.hovered_path() else { return };
         let rule = self.match_previewer(&e.name);
         // The whole screen size: a Vivid picture's grid position depends on
-        // it, not just the pane's size.
-        let sig = make_sig(&path, e.size, e.mtime, (self.screen.w, self.screen.h), rule.unwrap_or(usize::MAX));
+        // it, not just the pane's size. Only previewer rules are given the
+        // pane's width; built-in text is wrapped as it renders, so it stays
+        // put while the divider moves.
+        let layout = [self.screen.w, self.screen.h, pw];
+        let layout = if rule.is_some() { &layout[..] } else { &layout[..2] };
+        let sig = make_sig(&path, e.size, e.mtime, layout, rule.unwrap_or(usize::MAX));
         let mut pane = (pw, self.screen.h);
         let source = match rule.map(|i| &self.cfg.previewers[i]) {
             Some(r) => {
@@ -1671,7 +1779,7 @@ impl App {
         let source = Source::Shell(cmdline.to_string());
         let pane = (pane_w, self.screen.h);
         // Distinct from any hover sig (rule ids are < previewers.len()).
-        let sig = make_sig(&self.dir.path, plugin as u64, 0, pane, usize::MAX - 1);
+        let sig = make_sig(&self.dir.path, plugin as u64, 0, &[pane.0, pane.1], usize::MAX - 1);
         let hovered = self.dir.hovered_path();
         let sel = (!self.sel.is_empty()).then(|| self.sel.file.clone());
         let env = plugin::child_env(&self.dir.path, hovered.as_deref(), sel.as_deref(), self.ctx_i as u8);
@@ -1820,8 +1928,18 @@ impl App {
 
     // ---- mouse
 
-    fn on_click(&mut self, row: u16, _col: u16, kind: ClickKind) {
+    fn on_click(&mut self, row: u16, col: u16, kind: ClickKind) {
         match kind {
+            ClickKind::Single if self.on_divider(row, col) => {
+                self.dragging = true;
+                self.dirty = Dirty::Full; // highlights the divider, takes images down
+            }
+            ClickKind::Drag if self.dragging => self.move_divider(col),
+            ClickKind::Release if self.dragging => {
+                self.dragging = false;
+                self.settle_divider();
+            }
+            ClickKind::Drag | ClickKind::Release => {}
             ClickKind::WheelUp => self.move_cursor(-1),
             ClickKind::WheelDown => self.move_cursor(1),
             ClickKind::Right => {
@@ -1831,6 +1949,10 @@ impl App {
                 }
             }
             ClickKind::Single => {
+                // A drag whose release got lost ends here.
+                if std::mem::take(&mut self.dragging) {
+                    self.settle_divider();
+                }
                 if let Some(i) = self.row_to_index(row) {
                     self.set_cursor(i);
                 }
@@ -1878,10 +2000,11 @@ impl App {
     }
 
     /// Top-left cell of the pane body while an image may show there: the
-    /// pane is open and no overlay (menu, pager) covers it.
+    /// pane is open, no overlay (menu, pager) covers it, and the divider
+    /// isn't being dragged (the image is sized for where the drag began).
     fn graphics_origin(&self) -> Option<(u16, u16)> {
         let (pane_w, _) = self.preview_pane()?;
-        if matches!(self.mode, Mode::Menu(_) | Mode::Pager { .. }) {
+        if self.dragging || matches!(self.mode, Mode::Menu(_) | Mode::Pager { .. }) {
             return None;
         }
         Some((2, self.screen.w - pane_w + 1))
@@ -1973,13 +2096,12 @@ impl App {
         self.last_cursor = self.dir.cursor;
     }
 
-    /// Playable width of the entry pane (halved when preview is open).
+    /// Playable width of the entry pane: up to the divider when the preview
+    /// is open.
     fn pane_width(&self) -> usize {
-        let w = self.screen.w as usize;
-        if self.preview_pane().is_some() {
-            (w / 2 - 1).max(20)
-        } else {
-            w.max(20)
+        match self.divider() {
+            Some(divider) => usize::from(divider),
+            None => usize::from(self.screen.w).max(20),
         }
     }
 
@@ -1994,7 +2116,7 @@ impl App {
         // Row 0: context bar.
         self.ctxbar(&theme);
 
-        // Row 1: path (left pane only when the preview owns the right half).
+        // Row 1: path (left pane only when the preview owns the right side).
         let pw = self.pane_width();
         let shown = tilde_path(&self.dir.path, self.home.as_deref());
         let path_line = Line::plain(shown);
@@ -2026,7 +2148,7 @@ impl App {
             self.screen.put_text(2, 0, text, theme.divider, pw);
         }
 
-        // Preview pane (right half).
+        // Preview pane (right of the divider).
         if let Some((pane_w, _)) = self.preview_pane() {
             self.render_preview(pane_w as usize);
         }
@@ -2161,10 +2283,14 @@ impl App {
         let theme = self.cfg.theme.clone();
         let h = self.screen.h;
         let x = (self.screen.w as usize).saturating_sub(pane_w);
-        let focus_style = if self.preview_focused { theme.cursor } else { theme.divider };
-        // Divider.
+        let focus_style = if self.preview_focused || self.dragging { theme.cursor } else { theme.divider };
+        // Divider, and the body's padding column after it: blank it, since
+        // it held listing or preview text before the divider last moved.
         for r in 1..h.saturating_sub(1) {
             self.screen.put_text(r, x.saturating_sub(1) as u16, "│", focus_style, 1);
+            if r > 1 {
+                self.screen.put_text(r, x as u16, " ", Style::default(), 1);
+            }
         }
         // Header: hovered name (or the pinned plugin and its dir) + state.
         let name = match self.preview_pin.and_then(|p| self.cfg.plugins.get(p.plugin)) {
@@ -2249,6 +2375,25 @@ fn input_event(k: KeyEvent) -> Option<InputEv> {
         KeyCode::End => InputEv::End,
         _ => return None,
     })
+}
+
+/// Keeps a divider at `col` where both panes get `MIN_SIDE_COLS`.
+fn clamp_divider(w: u16, col: u16) -> u16 {
+    col.max(MIN_SIDE_COLS).min(w.saturating_sub(MIN_SIDE_COLS + 1))
+}
+
+/// The divider's column on a `w`-column screen when the preview takes
+/// `share` thousandths of it, the divider included.
+fn divider_col(w: u16, share: u16) -> u16 {
+    let cols = u32::from(w) * u32::from(share.min(1000)) / 1000;
+    clamp_divider(w, w - u16::try_from(cols).unwrap_or(w))
+}
+
+/// The smallest share that puts the divider at `col`: the inverse of
+/// [`divider_col`] on screens narrower than 1000 columns.
+fn share_at(w: u16, col: u16) -> u16 {
+    let cols = u32::from(w.saturating_sub(col));
+    u16::try_from((cols * 1000).div_ceil(u32::from(w.max(1)))).unwrap_or(1000)
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -2448,6 +2593,7 @@ fn apply_key_config(
         ("cycle_sort", Action::CycleSort), ("reverse_sort", Action::ReverseSort),
         ("cycle_time", Action::CycleTime), ("redraw", Action::Redraw),
         ("toggle_preview", Action::TogglePreview), ("help", Action::Help),
+        ("preview_wider", Action::PreviewWider), ("preview_narrower", Action::PreviewNarrower),
         ("filter", Action::Filter), ("cycle_filter_mode", Action::CycleFilterMode),
         ("select", Action::Select), ("select_mul", Action::SelectMul),
         ("select_all", Action::SelectAll), ("select_invert", Action::SelectInvert),
@@ -2490,6 +2636,7 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "  s / C-t            sort key / reverse      T  time type",
         "  .                  show hidden     d            detail toggle",
         "  f                  file info       P            preview toggle",
+        "  < / >              move the preview divider left / right (or drag it)",
         "  ?                  this help",
         "  Focused preview:   Up/Down scroll, PgDn/C-f down, PgUp/C-b up",
         "  Document preview:  j/k or PgDn/PgUp turn pages, Home/End first/last",
@@ -3331,6 +3478,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE })
+    }
+
+    /// The frame draws the divider glyph at screen cell (`row`, `col`).
+    fn divider_drawn_at(frame: &str, row: u16, col: u16) -> bool {
+        let cup = format!("\x1b[{};{}H", row + 1, col + 1);
+        frame.match_indices(&cup).any(|(at, _)| {
+            let rest = &frame[at + cup.len()..];
+            // An optional SGR sits between the cursor move and the glyph.
+            let rest = match rest.strip_prefix("\x1b[") {
+                Some(sgr) => sgr.split_once('m').map_or(rest, |(_, after)| after),
+                None => rest,
+            };
+            rest.starts_with('│')
+        })
+    }
+
+    #[test]
+    fn divider_math_keeps_the_half_layout_and_lands_on_every_column() {
+        for w in 100..=400 {
+            // The default share leaves the preview its old w/2 - 1 columns.
+            assert_eq!(w - divider_col(w, 500) - 1, w / 2 - 1, "w = {w}");
+            for col in MIN_SIDE_COLS..w - MIN_SIDE_COLS {
+                assert_eq!(divider_col(w, share_at(w, col)), col, "w = {w}, col = {col}");
+            }
+        }
+        // Both panes keep their minimum at the extremes.
+        assert_eq!(divider_col(120, 1000), MIN_SIDE_COLS);
+        assert_eq!(divider_col(120, 0), 120 - MIN_SIDE_COLS - 1);
+        assert_eq!(clamp_divider(120, 0), MIN_SIDE_COLS);
+        assert_eq!(clamp_divider(120, 119), 120 - MIN_SIDE_COLS - 1);
+    }
+
+    #[test]
+    fn angle_brackets_move_the_divider_and_keep_text_focus_and_scroll() {
+        // 90-column lines: two rows each in the default 57-column text area,
+        // one row each once the preview is widened to its maximum.
+        let text: String = (0..40).map(|i| format!("{i:090}\n")).collect();
+        let (mut app, d) = text_preview_app("divider-keys", &text);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        assert_eq!(app.divider(), Some(60));
+        app.handle_event(special(KeyCode::Right));
+        app.handle_event(special(KeyCode::End));
+        assert_eq!(app.preview_scroll, 80 - app.screen.list_rows());
+
+        // 5% of 120 columns per press; built-in text rewraps without a rerun.
+        app.handle_event(key('<'));
+        assert_eq!(app.divider(), Some(54));
+        assert_eq!(app.pane_width(), 54);
+        assert!(app.preview_focused);
+        assert!(!app.preview.is_busy() && app.preview.lines().is_some());
+        app.handle_event(key('>'));
+        app.handle_event(key('>'));
+        assert_eq!(app.divider(), Some(66));
+        app.render();
+        let frame = out.take();
+        assert!(divider_drawn_at(&frame, 2, 66) && !divider_drawn_at(&frame, 2, 60), "{frame:?}");
+
+        // Each side keeps its minimum; a wider pane pulls the scroll back in.
+        for _ in 0..30 {
+            app.handle_event(key('<'));
+        }
+        assert_eq!(app.divider(), Some(MIN_SIDE_COLS));
+        assert_eq!(app.preview_scroll, 40 - app.screen.list_rows());
+        assert!(app.preview_focused);
+        for _ in 0..30 {
+            app.handle_event(key('>'));
+        }
+        assert_eq!(app.divider(), Some(120 - MIN_SIDE_COLS - 1));
+
+        // Without a pane the keys only say so.
+        app.apply(Action::TogglePreview);
+        let share = app.preview_share;
+        app.handle_event(key('<'));
+        assert_eq!(app.preview_share, share);
+        assert_eq!(app.msg.as_ref().map(|(m, _)| m.as_str()), Some("no preview pane"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dragging_the_divider_resizes_both_panes() {
+        let (mut app, d) = test_app("divider-drag");
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.apply(Action::TogglePreview);
+        let (path, cursor) = (app.dir.path.clone(), app.dir.cursor);
+        assert_eq!(app.dir.hovered_name(), Some("subdir"));
+
+        // A drag that starts elsewhere leaves the divider alone.
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 10, 3));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 80, 3));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 80, 3));
+        assert_eq!(app.divider(), Some(60));
+        // Neither do presses on the context bar or the statusbar.
+        for row in [0, 29] {
+            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 60, row));
+            assert!(!app.dragging, "row {row}");
+        }
+
+        // Grabbed by the divider: the drag moves it and highlights it.
+        app.set_cursor(cursor);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 60, 12));
+        assert!(app.dragging);
+        assert_eq!(app.dir.cursor, cursor, "a divider press is not a row click");
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 12));
+        assert_eq!(app.divider(), Some(40));
+        assert_eq!(app.pane_width(), 40);
+        app.render();
+        let frame = out.take();
+        assert!(divider_drawn_at(&frame, 12, 40), "{frame:?}");
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 12));
+        assert_eq!(app.divider(), Some(MIN_SIDE_COLS));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 2, 12));
+        assert!(!app.dragging);
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 12));
+        assert_eq!(app.divider(), Some(MIN_SIDE_COLS), "released");
+
+        // The column after the divider grabs too, and a quick second press
+        // there is another grab, not a double click opening the hovered dir.
+        for _ in 0..2 {
+            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), MIN_SIDE_COLS + 1, 5));
+            assert!(app.dragging);
+            app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), MIN_SIDE_COLS + 1, 5));
+        }
+        assert_eq!(app.dir.path, path);
+
+        // Dragging works mid-filter and keeps a focused preview focused.
+        act(&mut app, Action::Filter);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), MIN_SIDE_COLS, 5));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 50, 5));
+        assert!(matches!(app.mode, Mode::Filter));
+        assert_eq!(app.divider(), Some(50));
+        act(&mut app, Action::Esc);
+        app.dir.move_to_name("alpha");
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 50, 5));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 5));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 60, 5));
+        assert!(app.preview_focused);
+        assert_eq!(app.divider(), Some(60));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// An app on `pic.png` + `notes.txt`, with a graphics previewer for
     /// `*.png` whose frame's image id is the pane size it was given ("WH").
     #[cfg(unix)]
@@ -3422,6 +3716,41 @@ mod tests {
         assert!(out.take().contains("\x1b_Ga=T,i=5827"));
         assert_eq!(app.run(), Flow::Quit(0)); // TestSource sends C-q
         assert!(out.take().ends_with("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previewers_rerun_at_the_new_width_once_the_divider_settles() {
+        let (mut app, d, out) = graphics_app("gfxdivider");
+        app.preview_on_hover();
+        drive_preview(&mut app);
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5827)));
+
+        // A key step reruns the previewer at once: 53 columns right of the divider.
+        app.handle_event(key('>'));
+        drive_preview(&mut app);
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5227)));
+        app.dirty = Dirty::Full;
+        app.render();
+        assert!(out.take().contains("\x1b[3;69H\x1b_Ga=T,i=5227"));
+
+        // While dragging, the image is down and the previewer isn't rerun.
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 66, 10));
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=d,d=I,i=5227,q=2\x1b\\"));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 10));
+        app.render();
+        assert!(!out.take().contains("\x1b_Ga=T"), "no image mid-drag");
+        assert!(!app.preview.is_busy());
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5227)));
+
+        // Released: 69 columns right of the divider, the image back at its new origin.
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 50, 10));
+        drive_preview(&mut app);
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(6827)));
+        app.render();
+        assert!(out.take().contains("\x1b[3;53H\x1b_Ga=T,i=6827"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

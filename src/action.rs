@@ -45,6 +45,8 @@ pub enum Action {
     CycleTime,    // T: mtime → atime → crtime
     Redraw,       // C-l
     TogglePreview, // P
+    PreviewWider,  // <: preview divider one step left
+    PreviewNarrower, // >: preview divider one step right
     AutoNext,     // C-j: auto-advance after open
     Help,         // ?
     // filter
@@ -88,6 +90,10 @@ pub enum ClickKind {
     Right,
     WheelUp,
     WheelDown,
+    /// Motion with the left button held.
+    Drag,
+    /// The left button went up.
+    Release,
 }
 
 /// Keystrokes routed to the active InputLine (filter / prompts).
@@ -163,6 +169,8 @@ pub fn default_keymap() -> HashMap<KeyEvent, Action> {
     bind(Char('T'), KeyModifiers::SHIFT, Action::CycleTime);
     bind(Char('l'), c, Action::Redraw);
     bind(Char('P'), KeyModifiers::SHIFT, Action::TogglePreview);
+    bind(Char('<'), KeyModifiers::NONE, Action::PreviewWider);
+    bind(Char('>'), KeyModifiers::NONE, Action::PreviewNarrower);
     bind(Char('j'), c, Action::AutoNext);
     bind(Char('?'), KeyModifiers::NONE, Action::Help);
     // filter
@@ -237,6 +245,8 @@ mod tests {
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)], Action::Rename);
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE)], Action::GotoCtx(3));
         assert_eq!(m[&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)], Action::CycleSort);
+        assert_eq!(m[&KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE)], Action::PreviewWider);
+        assert_eq!(m[&KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE)], Action::PreviewNarrower);
         assert!(!m.contains_key(&KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)));
         // Sanity: every Action variant is reachable from at least one key
         // except the synthetic ones (Click/Resize/Input/Esc/PluginRun).
