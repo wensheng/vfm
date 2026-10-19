@@ -1,9 +1,8 @@
 # vfm
 
-A small, fast terminal file manager in safe Rust.
-Linux, macOS and Windows.
+A small, fast terminal file manager, runs on Linux, macOS and Windows.
 
-- **Small:** ~1.2 MB stripped binary; crossterm, unicode-width, toml, regex-lite,
+- **Small:** ~1 MB binary; crossterm, unicode-width, toml, regex-lite,
   trash, and a platform helper (libc on Unix, crossterm_winapi on Windows).
 - **Fast:** one directory in memory, 40-byte entries, lazy sorting, and a
   two-line redraw for cursor moves. Measured: ~3 ms to load and render a
@@ -16,6 +15,12 @@ Linux, macOS and Windows.
   [kitpdf](https://github.com/wensheng/kitpdf), on terminals with kitty graphics.
   Inside the Vivido terminal, [vivi](https://github.com/vivido-dev/vivi) and
   [vvrd](https://github.com/vivido-dev/vvrd) take their place.
+
+## Install
+
+```sh
+cargo install vfm
+```
 
 ## Build
 

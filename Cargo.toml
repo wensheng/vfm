@@ -3,7 +3,7 @@ name = "vfm"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
-description = "A small, fast, terminal file manager modeled after nnn"
+description = "A small, fast, terminal file manager"
 license = "Apache-2.0"
 
 [dependencies]
