@@ -9,13 +9,10 @@ A small, fast terminal file manager, runs on Linux, macOS and Windows.
   2,700-entry dir, ~12 ms for 20,000 entries, 4.4 MB RSS.
 - **Safe:** no `unsafe`, no `Mutex`. Workers talk to the UI over channels and
   atomics only.
-- **Plugins for preview:** any command that prints to stdout (ANSI colors
-  supported) can be a previewer. Image and video previews, through
-  [kitim](https://github.com/wensheng/kitim), and PDF/EPUB previews through
-  [kitpdf](https://github.com/wensheng/kitpdf), on terminals with kitty graphics.
-  Vivido and Vivida can use a separate profile with
-  [vivi](https://github.com/vivido-dev/vivi) and
-  [vvrd](https://github.com/vivido-dev/vvrd).
+- **Plugins for preview:** commands, arguments, file patterns, and terminal
+  profiles come from configuration. Text with ANSI colors, Kitty graphics,
+  and the Vivid side channel are supported. No external preview program is
+  selected automatically.
 
 ## Install
 
@@ -115,19 +112,6 @@ smartcase = true
 enabled     = true
 debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
-bat         = true        # highlight text previews with bat (or batcat), if installed
-line_numbers = true       # use bat -n; false uses bat -p without line numbers
-
-[preview.kitty]          # Kitty graphics terminals: kitty, Ghostty, cmux, etc.
-kitim       = false       # image/video previews via kitim
-kitim_sound = false       # play videos' sound in those previews
-kitpdf      = false       # PDF/EPUB previews with page navigation
-
-# Optional: omit this section to use the Kitty settings in Vivido/Vivida.
-[preview.vivido]         # Vivido and Vivida share this profile
-vivi        = false       # image/video previews via vivi
-vivi_sound  = false       # play videos' sound in those previews
-vvrd        = false       # PDF/EPUB/SVG/Markdown previews with page navigation
 
 [colors]                  # name, 0-255, or 0xRRGGBB
 dir = "blue"
@@ -141,13 +125,13 @@ quit = "C-x"
 
 [[previewer]]             # first matching rule wins
 match = ["*.rs", "*.toml", "*.md"]
-run   = "bat --color=always --style=plain"
+run   = "my-text-preview --color" # your command or wrapper, accepts PATH WIDTH HEIGHT
 # graphics = true         # run prints kitty graphics, not text (see below)
 # vivid = true            # run draws through Vivid itself (see below)
 
 [[opener]]                # Enter runs these fullscreen, file name appended
 match = ["*.pdf", "*.PDF"]
-run   = "kitpdf"
+run   = "my-document-reader"
 
 [[plugin]]
 name     = "git status"
@@ -173,62 +157,71 @@ colors independently of icons.
 
 ### Terminal-specific previews
 
-`[preview.kitty]` configures terminals that answer the Kitty graphics probe,
-including kitty, Ghostty, and cmux. Vivido and Vivida form a separate category
-and use `[preview.vivido]` when it exists. If that section is absent, they use
-the Kitty settings after answering the same graphics probe. An empty Vivido
-section disables this inheritance; omitted or disabled viewers in an explicit
-Vivido section do not fall back to their Kitty counterparts.
+Every external preview is an explicit rule with filename globs and a command.
+vfm does not associate executables, options, or extensions with a terminal.
+It selects a terminal profile, finds the first matching rule, and runs that
+rule using the chosen output protocol.
 
-For example, this config uses kitim and kitpdf in Kitty graphics terminals,
-and vivi and vvrd in Vivido or Vivida:
+`[[preview.kitty.previewer]]` configures terminals that answer the Kitty
+graphics probe, including kitty, Ghostty, and cmux. Vivido and Vivida share
+`[[preview.vivido.previewer]]`. Without a Vivido section, they inherit the
+Kitty rules after answering the graphics probe. When a Vivido section exists,
+its rules replace the Kitty profile, including for extensions it does not
+list. An empty `[preview.vivido]` disables inheritance too.
 
-```toml
-[preview.kitty]
-kitim = true
-kitpdf = true
-
-[preview.vivido]
-vivi = true
-vvrd = true
-```
-
-Each profile also accepts custom rules. Rules run in their listed order,
-before that profile's built-in viewers. The selected profile takes precedence
-over shared top-level `[[previewer]]` rules, which remain fallbacks in every
-terminal. Use `graphics = true` for Kitty output and `vivid = true` for the
-Vivid side channel; the profile selects the terminal independently of the
-output protocol.
+For example, the following configuration chooses these commands for PDFs:
 
 ```toml
 [[preview.kitty.previewer]]
 match = ["*.pdf", "*.PDF"]
-run = "/path/to/kitpdf --preview"
+run = "kitpdf --preview"
 graphics = true
 interactive = true
 
 [[preview.vivido.previewer]]
 match = ["*.pdf", "*.PDF"]
-run = "/path/to/vvrd --preview"
+run = "vvrd --preview"
 vivid = true
 interactive = true
 ```
 
-The older `[preview] kitim`, `kitim_sound`, and `kitpdf` switches still work as
-Kitty defaults, after shared custom rules. `[preview.kitty]` overrides those
-switches and moves its viewers ahead of shared rules. These switches no longer
-automatically enable vivi or vvrd; enable them explicitly in `[preview.vivido]`.
+The command names above are examples. Any program implementing the same
+preview protocol can replace them, and any filename globs can be used.
+Rules run in their listed order within the selected profile, before shared
+top-level `[[previewer]]` rules. Shared rules remain fallbacks for every
+terminal. Unmatched files use the built-in plain text, directory, symlink,
+or binary summary preview. A missing configured program shows an error;
+vfm does not substitute another executable.
+
+See [config.example.toml](config.example.toml) for complete image, video,
+document, and text rules using kitim, kitpdf, vivi, vvrd, and bat. All program
+names, extension lists, audio flags, highlighting options, and line-number
+options live in that file. Copy the rules you need and change the commands
+and patterns to suit your installed programs.
+
+The old program-specific switches under `[preview]`, `[preview.kitty]`, or
+`[preview.vivido]` have been removed. Preview settings report unknown keys;
+replace those switches with explicit `match` and `run` rules. Automatic
+fullscreen media openers have also been removed: use `[[opener]]` rules.
 
 ## Plugin protocol
 
 **Previewers** run as `<run…> PATH WIDTH HEIGHT`, with stdout piped. vfm parses
 SGR colors and strips other escape sequences. With no matching rule, a built-in
 preview shows text heads, directory listings, symlink targets, and binary file
-types. If [bat](https://github.com/sharkdp/bat) is installed (as `bat` or
-`batcat`), text previews are syntax-highlighted with line numbers (`bat -n`)
-by default. Set `line_numbers = false` under `[preview]` to hide the numbers
-(`bat -p`), or `bat = false` to use the built-in plain preview. Moving the cursor
-kills a slow previewer immediately; recent results are cached.
+types. Syntax highlighting is provided by an explicit text preview rule;
+there is no automatic highlighter selection. Moving the cursor kills a slow
+previewer immediately; recent results are cached.
+
+Commands receive `PATH WIDTH HEIGHT` appended to their configured arguments.
+Programs that do not accept those arguments need a wrapper. For example,
+this POSIX shell rule passes only the path to bat:
+
+```toml
+[[previewer]]
+match = ["*.rs", "*.toml", "*.txt"]
+run = """sh -c 'exec bat --color=always --paging=never --wrap=never -n -- "$1"' sh"""
+```
 
 ### Graphics previewers
 
@@ -279,127 +272,31 @@ draws text over Vivid media, so vfm leaves the pane body blank meanwhile.
 Inside tmux or screen, Vivid grid positions are the outer window's, not the
 pane's, so pictures land in the wrong place there.
 
-### Built-in plugin: kitpdf
+### Interactive document previews
 
-Build and install the companion kitpdf checkout with pane support:
+Set `interactive = true` on a rule whose command accepts page commands.
+Press `P` to show the preview, then `l`/Right to focus it. `j`/Down,
+PageDown, Ctrl-f, or Right sends `next`; `k`/Up, PageUp, or Ctrl-b sends
+`prev`. Home/End sends `first`/`last`. Esc or `h`/Left returns focus to the
+file list. Enter retains its normal open-file action.
 
-```sh
-cargo install --path ../kitpdf
-```
-
-Run that from the vfm checkout, then add this to `config.toml`:
-
-```toml
-[preview.kitty]
-kitpdf = true
-```
-
-Press `P` to show the preview, select a PDF or EPUB, and press `l`/Right to
-focus it. `j`/Down, PageDown, Ctrl-f, or Right turn to the next page;
-`k`/Up, PageUp, or Ctrl-b turn back. Home/End jump to the first/last page.
-Esc or `h`/Left returns focus to the file list. The focused header shows the
-page controls. Enter retains its normal open-file action.
-
-The plugin starts at page 1, keeps the document open for page turns, and
-reflows EPUB text for the pane. Resizing or selecting another file starts
-a fresh preview. It requires a terminal that answers vfm's Kitty graphics
-probe; other terminals keep their normal fallback preview. Missing kitpdf
-or unreadable documents show an error in the pane.
-
-To use [vvrd](https://github.com/vivido-dev/vvrd)'s pane mode inside Vivido or
-Vivida, install a vvrd with `--preview` on `PATH` and add:
-
-```toml
-[preview.vivido]
-vvrd = true
-```
-
-This previews PDF, EPUB, SVG, and Markdown files. Without the Vivido section,
-Vivido and Vivida use kitpdf through Kitty graphics. Focus and page keys work
-the same way, and Enter opens the file in vvrd full screen when installed.
-
-The built-in rules are added after custom rules in their profile. To use a
-specific executable, configure the equivalent rule instead:
-
-```toml
-[[preview.kitty.previewer]]
-match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]
-run = "kitpdf --preview"
-graphics = true
-interactive = true
-```
-
-For Vivido and Vivida, configure vvrd's rule in their profile:
-
-```toml
-[[preview.vivido.previewer]]
-match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.MD"]
-run = "vvrd --preview"
-vivid = true
-interactive = true
-```
-
-### Built-in plugin: kitim
-
-The image/video graphics previewer is off by default. Install a
-[kitim](https://github.com/wensheng/kitim) that has `--preview`, then enable it
-in `config.toml`:
-
-```toml
-[preview.kitty]
-kitim = true
-```
-
-That previews images (png, jpg, gif, webp, bmp, ico, tiff, tga, qoi, pnm) and
-videos (mp4, m4v, mkv, webm, mov, avi, wmv, flv, mpg, mpeg, 3gp), in lower or
-upper case. Animated GIFs and videos loop until you move the cursor. Videos
-are muted unless you also set `kitim_sound = true`; then their sound plays,
-and stops when you move off the file or vfm runs another program.
-
-To use [vivi](https://github.com/vivido-dev/vivi)'s pane mode inside Vivido or
-Vivida, install a vivi with `--preview` on `PATH` and add:
-
-```toml
-[preview.vivido]
-vivi = true
-vivi_sound = false       # true runs vivi --sound --preview
-```
-
-Without the Vivido section, Vivido and Vivida use kitim through Kitty graphics.
-
-Behind each switch, vfm adds a rule like the ones below, after your own rules
-in that profile. Don't copy them into your config: a rule of yours wins for
-the files it matches, so it replaces the built-in one there, including the
-profile's sound setting. Write one only to change something, such as a viewer
-that isn't on `PATH` or other file types:
-
-```toml
-[[preview.vivido.previewer]]         # Vivido and Vivida only
-match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
-run      = "vivi --preview"          # "vivi --sound --preview" with vivi_sound
-vivid    = true
-
-[[preview.kitty.previewer]]
-match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
-run      = "kitim --preview"         # "kitim --sound --preview" with kitim_sound
-graphics = true
-```
+The configured previewer handles page boundaries, rendering, reflow, and
+supported document types. Selecting another file or resizing starts a new
+preview using the matching rule. vfm does not add program-specific flags.
 
 ### Opening files
 
 Enter on a directory enters it; on an executable, runs it. Other files open
 the first matching `[[opener]]` rule's `run` command fullscreen, with the
-file's quoted name appended (`kitpdf photo.pdf`). With no matching rule:
+file's quoted name appended. With no matching rule, files whose head reads
+as text open in `$VISUAL`/`$EDITOR` (vi by default); binary files stay
+unopened. No media or document program is selected automatically.
 
-- inside Vivido, PDF, EPUB, SVG and Markdown files open in vvrd, and image,
-  video and audio files in `vivi --fullscreen`, when those are on `PATH`
-  (`e` still edits Markdown),
-- image, video and audio files open in
-  [kitim](https://github.com/wensheng/kitim) fullscreen — images fill the
-  screen and any key returns — when it is on `PATH` and the terminal
-  answered the kitty-graphics probe,
-- files whose head reads as text open in `$VISUAL`/`$EDITOR` (vi by default),
-- anything else does nothing — no editor over binary bytes.
+```toml
+[[opener]]
+match = ["*.pdf", "*.PDF"]
+run = "my-document-reader --fullscreen"
+```
 
 `e` always opens `$EDITOR` on the hovered file, whatever it is.
 

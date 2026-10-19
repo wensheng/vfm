@@ -34,7 +34,7 @@ const MAX_LINES: usize = 20_000;
 /// How long a superseded Vivid previewer gets to tear down after its stdin
 /// closes, before it is killed.
 ///
-/// Clean teardown removes its picture at once and lets vvrd stop its render
+/// Clean teardown removes its picture at once and lets the child stop its render
 /// workers; a kill also removes the picture, when the presenter sees the
 /// connection drop. Reaping is off-thread, so this never delays input.
 const VIVID_GRACE: Duration = Duration::from_millis(300);
@@ -45,23 +45,6 @@ const READ_BUF: usize = 64 * 1024;
 
 /// Bytes of a file's head checked to tell text from binary.
 const SNIFF_BYTES: usize = 8192;
-
-/// Programs tried, in order, for highlighted text previews. Debian and
-/// Ubuntu install bat as `batcat`.
-const BAT_NAMES: [&str; 2] = ["bat", "batcat"];
-
-/// Keep colors and requested decorations through the pipe, with no pager
-/// or wrapping, since the pane wraps lines itself.
-const BAT_FLAGS: [&str; 4] = ["--color=always", "--decorations=always", "--paging=never", "--wrap=never"];
-
-/// The highlighter argv for text previews: bat, if `enabled` and
-/// `installed` finds it under one of its names. `line_numbers` selects
-/// numbered (`-n`) or plain (`-p`) output.
-pub fn bat_argv(enabled: bool, line_numbers: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
-    let prog = BAT_NAMES.into_iter().filter(|_| enabled).find(|name| installed(name))?;
-    let style = if line_numbers { "-n" } else { "-p" };
-    Some(std::iter::once(prog).chain(BAT_FLAGS).chain([style]).map(String::from).collect())
-}
 
 // ---------------------------------------------------------------- signature
 
@@ -366,9 +349,6 @@ pub struct Preview {
     frames: u64,
     pub debounce: Duration,
     pub max_bytes: usize,
-    /// Runs text files that no `[[previewer]]` rule matches (see [`bat_argv`]);
-    /// `None` keeps the built-in plain-text head.
-    pub highlight: Option<Vec<String>>,
     /// Something covers the pane: a Vivid previewer is told to hide.
     covered: bool,
     /// Snapshot taken at request() time; used when the debounce expires.
@@ -390,7 +370,6 @@ impl Preview {
             frames: 0,
             debounce,
             max_bytes,
-            highlight: None,
             covered: false,
             pane: (80, 24),
             env: Vec::new(),
@@ -616,17 +595,18 @@ impl Preview {
         let vivid = matches!(target.source, Source::Vivid { .. });
         let interactive = matches!(target.source, Source::InteractiveGraphics(_));
         let command = match &target.source {
-            Source::Builtin => match self.highlighter(&target.path) {
-                Some(command) => command,
-                None => {
-                    let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
-                    let sig = target.sig;
-                    let lines: std::sync::Arc<[Line]> = lines.into();
-                    self.cache_put(sig, lines.clone(), truncated);
-                    self.state = PreviewState::Done { sig, lines, truncated };
-                    return Tick::Finished;
-                }
-            },
+            Source::Builtin => {
+                let (lines, truncated) = builtin_preview(&target.path, self.pane, self.max_bytes);
+                let sig = target.sig;
+                let lines: std::sync::Arc<[Line]> = lines.into();
+                self.cache_put(sig, lines.clone(), truncated);
+                self.state = PreviewState::Done {
+                    sig,
+                    lines,
+                    truncated,
+                };
+                return Tick::Finished;
+            }
             Source::Previewer(argv)
             | Source::Graphics(argv)
             | Source::InteractiveGraphics(argv)
@@ -673,32 +653,6 @@ impl Preview {
             }
         }
     }
-}
-
-impl Preview {
-    /// The highlighter command for `path` if it is a readable text file.
-    /// Binary files stay built-in: bat passes them through when piped.
-    /// Load beyond the initial pane for focused scrolling, but bound the
-    /// highlighting work. One extra line lets the reader detect truncation.
-    fn highlighter(&self, path: &Path) -> Option<Command> {
-        let (prog, flags) = self.highlight.as_ref()?.split_first()?;
-        if !is_text_file(path) {
-            return None;
-        }
-        let mut c = Command::new(prog);
-        c.args(flags)
-            .arg(format!("--line-range=:{}", MAX_LINES + 1))
-            .arg("--")
-            .arg(path)
-            .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(&self.cwd);
-        Some(c)
-    }
-}
-
-/// A regular file (not a symlink) whose head reads as text.
-fn is_text_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && head_is_text(path)
 }
 
 /// Whether opening `path` lands in a text editor: a regular file — symlinks
@@ -1024,60 +978,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn text_files_go_through_the_highlighter_and_the_rest_stays_builtin() {
-        let d = tmpdir("highlight");
-        std::fs::write(d.join("t.rs"), b"fn main() {}\n").unwrap();
-        std::fs::write(d.join("bin.dat"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
-        std::fs::create_dir(d.join("sub")).unwrap();
+    fn configured_text_preview_receives_only_the_standard_arguments() {
+        let d = tmpdir("configured-text");
+        let path = d.join("file.custom");
+        std::fs::write(&path, b"text\n").unwrap();
         let mut pv = Preview::new(Duration::ZERO, 64 * 1024);
         pv.set_context((40, 24), Vec::new(), &d);
-        // Echoes the arguments vfm appends.
-        let echo = r#"printf 'HL %s %s %s\n' "$1" "$2" "$3""#;
-        pv.highlight = Some(vec!["sh".into(), "-c".into(), echo.into(), "sh".into()]);
-        let mut show = |name: &str, sig| {
-            let target = Target { path: d.join(name), source: Source::Builtin, sig };
-            pv.request(target, Instant::now());
-            run_to_done(&mut pv);
-            pv.lines().unwrap().0.iter().map(|l| l.text()).collect::<Vec<_>>()
-        };
-        let path = d.join("t.rs").display().to_string();
-        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:{} -- {path}", MAX_LINES + 1)]);
-        assert_eq!(show("bin.dat", 2)[0], "binary: PNG image");
-        assert!(show("sub", 3).is_empty(), "empty dir listing");
-        let _ = std::fs::remove_dir_all(&d);
+        let script = r#"printf '%s\n' "$@""#;
+        let source = Source::Previewer(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
+        pv.request(
+            Target {
+                path: path.clone(),
+                source,
+                sig: 1,
+            },
+            Instant::now(),
+        );
+        run_to_done(&mut pv);
+        let lines: Vec<String> = pv.lines().unwrap().0.iter().map(|l| l.text()).collect();
+        assert_eq!(
+            lines,
+            [path.display().to_string(), "40".into(), "24".into()]
+        );
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[cfg(unix)]
     #[test]
-    fn highlighted_preview_marks_the_line_limit_as_truncated() {
-        let d = tmpdir("highlight-limit");
-        let path = d.join("large.txt");
+    fn configured_text_preview_marks_the_line_limit_as_truncated() {
+        let d = tmpdir("configured-limit");
+        let path = d.join("large.custom");
         std::fs::write(&path, "x\n".repeat(MAX_LINES + 2)).unwrap();
         let mut pv = Preview::new(Duration::ZERO, 256 * 1024);
         pv.set_context((40, 24), Vec::new(), &d);
-        let script = r#"head -n "${1##*:}" "$3""#;
-        pv.highlight = Some(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
-        pv.request(Target { path, source: Source::Builtin, sig: 1 }, Instant::now());
+        let script = r#"cat "$1""#;
+        let source = Source::Previewer(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
+        pv.request(
+            Target {
+                path,
+                source,
+                sig: 1,
+            },
+            Instant::now(),
+        );
         run_to_done(&mut pv);
         let (lines, truncated) = pv.lines().unwrap();
         assert_eq!(lines.len(), MAX_LINES);
         assert!(truncated);
         let _ = std::fs::remove_dir_all(d);
-    }
-
-    #[test]
-    fn bat_is_found_under_either_name_unless_disabled() {
-        for (line_numbers, style) in [(true, "-n"), (false, "-p")] {
-            let flags = |prog: &str| {
-                [prog, "--color=always", "--decorations=always", "--paging=never", "--wrap=never", style]
-                    .map(String::from)
-                    .to_vec()
-            };
-            assert_eq!(bat_argv(true, line_numbers, |p| p == "bat"), Some(flags("bat")));
-            assert_eq!(bat_argv(true, line_numbers, |p| p == "batcat"), Some(flags("batcat")));
-            assert_eq!(bat_argv(true, line_numbers, |_| false), None);
-            assert_eq!(bat_argv(false, line_numbers, |_| true), None);
-        }
     }
 
     #[test]

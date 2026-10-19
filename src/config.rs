@@ -59,18 +59,8 @@ pub struct PreviewCfg {
     pub enabled: bool,
     pub debounce_ms: u64,
     pub max_bytes: usize,
-    /// Image and video previews through kitim, off by default.
-    pub kitim: bool,
-    /// Videos previewed by kitim play their sound.
-    pub kitim_sound: bool,
-    /// PDF and EPUB previews with page navigation through kitpdf.
-    pub kitpdf: bool,
     /// An explicit Vivido profile replaces Kitty settings in Vivido and Vivida.
     pub vivido: bool,
-    /// Highlight text previews with bat when it is installed.
-    pub bat: bool,
-    /// Show line numbers in bat text previews.
-    pub line_numbers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -122,101 +112,6 @@ impl PreviewerRule {
     }
 }
 
-/// File types kitim previews: what the image crate decodes, plus video
-/// containers FFmpeg plays. Globs are case-sensitive, hence both cases.
-const KITIM_TYPES: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "tga", "qoi", "pnm", "ppm", "pgm", "pbm",
-    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "mpg", "mpeg", "3gp",
-];
-
-/// Audio types kitim plays but can't preview: no picture to show.
-const KITIM_AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "alac", "aiff", "aif"];
-
-/// Documents vvrd reads, in Vivid: kitpdf's types plus SVG and Markdown.
-const VVRD_TYPES: &[&str] = &["pdf", "epub", "svg", "md", "markdown", "mkd"];
-
-/// Whether Enter opens `name` in kitim (or vivi, in Vivid): an image, video
-/// or audio extension, in any case. The viewer decides if it can show it.
-pub fn is_kitim_media(name: &str) -> bool {
-    has_extension(name, KITIM_TYPES.iter().chain(KITIM_AUDIO))
-}
-
-/// Whether Enter opens `name` in vvrd, in Vivid: a PDF, EPUB, SVG or
-/// Markdown extension, in any case.
-pub fn is_vvrd_document(name: &str) -> bool {
-    has_extension(name, VVRD_TYPES.iter())
-}
-
-fn has_extension<'a>(name: &str, mut types: impl Iterator<Item = &'a &'a str>) -> bool {
-    // Path::extension treats ".png" as a hidden file with no extension.
-    let Some(ext) = std::path::Path::new(name).extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    let ext = ext.to_ascii_lowercase();
-    types.any(|t| ext == *t)
-}
-
-/// `*.ext` and `*.EXT` for each type: globs are case-sensitive.
-fn both_cases(types: &[&str]) -> Vec<String> {
-    types.iter().flat_map(|ext| [format!("*.{ext}"), format!("*.{}", ext.to_uppercase())]).collect()
-}
-
-/// The rule `[preview] kitim = true` adds: kitim's embedded preview mode,
-/// which takes the path, width and height vfm appends. With `sound`, videos
-/// play their audio.
-pub fn kitim_rule(sound: bool) -> PreviewerRule {
-    let cmd = if sound { "kitim --sound --preview" } else { "kitim --preview" };
-    let patterns = both_cases(KITIM_TYPES);
-    PreviewerRule {
-        patterns,
-        cmd: cmd.into(),
-        scope: PreviewerScope::Kitty,
-        graphics: true,
-        vivid: false,
-        interactive: false,
-    }
-}
-
-/// Vivi's pane mode for images and videos in the Vivido profile.
-///
-/// It takes the pane's grid position after its size.
-pub fn vivi_rule(sound: bool) -> PreviewerRule {
-    let cmd = if sound { "vivi --sound --preview" } else { "vivi --preview" };
-    let patterns = both_cases(KITIM_TYPES);
-    PreviewerRule {
-        patterns,
-        cmd: cmd.into(),
-        scope: PreviewerScope::Vivido,
-        graphics: false,
-        vivid: true,
-        interactive: false,
-    }
-}
-
-/// The built-in PDF/EPUB previewer, enabled with `[preview] kitpdf = true`.
-pub fn kitpdf_rule() -> PreviewerRule {
-    PreviewerRule {
-        patterns: ["*.pdf", "*.PDF", "*.epub", "*.EPUB"].map(String::from).into(),
-        cmd: "kitpdf --preview".into(),
-        scope: PreviewerScope::Kitty,
-        graphics: true,
-        vivid: false,
-        interactive: true,
-    }
-}
-
-/// Vvrd's pane mode for PDF, EPUB, SVG, and Markdown in the Vivido profile.
-pub fn vvrd_rule() -> PreviewerRule {
-    PreviewerRule {
-        patterns: both_cases(VVRD_TYPES),
-        cmd: "vvrd --preview".into(),
-        scope: PreviewerScope::Vivido,
-        graphics: false,
-        vivid: true,
-        interactive: true,
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct PluginDef {
     pub name: String,
@@ -264,12 +159,7 @@ impl Default for Config {
                 enabled: true,
                 debounce_ms: 40,
                 max_bytes: 256 * 1024,
-                kitim: false,
-                kitim_sound: false,
-                kitpdf: false,
                 vivido: false,
-                bat: true,
-                line_numbers: true,
             },
             theme: Theme::default(),
             previewers: Vec::new(),
@@ -373,57 +263,32 @@ impl Config {
             if let Some(v) = p.get("max_bytes").and_then(|v| v.as_integer()) {
                 self.preview.max_bytes = (v.max(1024) as usize).min(16 * 1024 * 1024);
             }
-            get_bool(p, "kitim", &mut self.preview.kitim);
-            get_bool(p, "kitim_sound", &mut self.preview.kitim_sound);
-            get_bool(p, "kitpdf", &mut self.preview.kitpdf);
-            get_bool(p, "bat", &mut self.preview.bat);
-            get_bool(p, "line_numbers", &mut self.preview.line_numbers);
+            check_keys(
+                p,
+                "preview",
+                &["enabled", "debounce_ms", "max_bytes", "kitty", "vivido"],
+                &mut errs,
+            );
             // Explicit profiles precede shared rules. A missing Vivido profile
             // inherits Kitty rules; even an empty Vivido table opts out.
             self.preview.vivido = p.contains_key("vivido");
-            if let Some(value) = p.get("vivido") {
-                if let Some(v) = value.as_table() {
-                    self.previewers.extend(previewer_rules(
-                        v,
-                        "preview.vivido.previewer",
-                        PreviewerScope::Vivido,
-                        &mut errs,
-                    ));
-                    let mut vivi = false;
-                    let mut sound = false;
-                    let mut vvrd = false;
-                    get_bool(v, "vivi", &mut vivi);
-                    get_bool(v, "vivi_sound", &mut sound);
-                    get_bool(v, "vvrd", &mut vvrd);
-                    if vivi {
-                        self.previewers.push(vivi_rule(sound));
+            for (name, scope) in [
+                ("vivido", PreviewerScope::Vivido),
+                ("kitty", PreviewerScope::Kitty),
+            ] {
+                if let Some(value) = p.get(name) {
+                    let section = format!("preview.{name}");
+                    if let Some(profile) = value.as_table() {
+                        check_keys(profile, &section, &["previewer"], &mut errs);
+                        self.previewers.extend(previewer_rules(
+                            profile,
+                            &format!("{section}.previewer"),
+                            scope,
+                            &mut errs,
+                        ));
+                    } else {
+                        errs.push(format!("[{section}] must be a table"));
                     }
-                    if vvrd {
-                        self.previewers.push(vvrd_rule());
-                    }
-                } else {
-                    errs.push("[preview.vivido] must be a table".into());
-                }
-            }
-            if let Some(value) = p.get("kitty") {
-                if let Some(k) = value.as_table() {
-                    self.previewers.extend(previewer_rules(
-                        k,
-                        "preview.kitty.previewer",
-                        PreviewerScope::Kitty,
-                        &mut errs,
-                    ));
-                    get_bool(k, "kitim", &mut self.preview.kitim);
-                    get_bool(k, "kitim_sound", &mut self.preview.kitim_sound);
-                    get_bool(k, "kitpdf", &mut self.preview.kitpdf);
-                    if self.preview.kitim {
-                        self.previewers.push(kitim_rule(self.preview.kitim_sound));
-                    }
-                    if self.preview.kitpdf {
-                        self.previewers.push(kitpdf_rule());
-                    }
-                } else {
-                    errs.push("[preview.kitty] must be a table".into());
                 }
             }
         }
@@ -433,16 +298,6 @@ impl Config {
             PreviewerScope::Shared,
             &mut errs,
         ));
-        // Legacy switches remain Kitty defaults, after the user's rules.
-        let kitty_profile = t.get("preview").and_then(|v| v.get("kitty")).is_some();
-        if !kitty_profile {
-            if self.preview.kitim {
-                self.previewers.push(kitim_rule(self.preview.kitim_sound));
-            }
-            if self.preview.kitpdf {
-                self.previewers.push(kitpdf_rule());
-            }
-        }
         // [[opener]] definitions
         if let Some(rules) = t.get("opener").and_then(|v| v.as_array()) {
             for r in rules {
@@ -524,11 +379,18 @@ fn previewer_rules(
     errs: &mut Vec<String>,
 ) -> Vec<PreviewerRule> {
     let mut parsed = Vec::new();
-    let Some(rules) = t.get("previewer").and_then(|v| v.as_array()) else {
+    let Some(value) = t.get("previewer") else {
+        return parsed;
+    };
+    let Some(rules) = value.as_array() else {
+        errs.push(format!("[[{section}]] must be an array of tables"));
         return parsed;
     };
     for r in rules {
-        let Some(tbl) = r.as_table() else { continue };
+        let Some(tbl) = r.as_table() else {
+            errs.push(format!("[[{section}]] must contain tables"));
+            continue;
+        };
         let Some(cmd) = tbl.get("run").and_then(|v| v.as_str()).map(String::from) else {
             errs.push(format!("[[{section}]] missing `run`"));
             continue;
@@ -570,6 +432,15 @@ fn previewer_rules(
         });
     }
     parsed
+}
+
+/// Reports unsupported settings without assigning meaning to program names.
+fn check_keys(t: &toml::Table, section: &str, allowed: &[&str], errs: &mut Vec<String>) {
+    for key in t.keys() {
+        if !allowed.contains(&key.as_str()) {
+            errs.push(format!("[{section}]: unknown setting `{key}`"));
+        }
+    }
 }
 
 fn get_bool(t: &toml::Table, key: &str, dst: &mut bool) {
@@ -707,7 +578,7 @@ reverse = true
 
 [[previewer]]
 match = ["*.md", "*.rs"]
-run = "bat --color=always"
+run = "text-renderer --color=always"
 
 [[plugin]]
 name = "git status"
@@ -728,7 +599,7 @@ dir = "cyan"
         assert_eq!(cfg.sort.key, SortKey::Mtime);
         assert!(cfg.sort.reverse);
         assert_eq!(cfg.previewers.len(), 1);
-        assert_eq!(cfg.previewers[0].cmd, "bat --color=always");
+        assert_eq!(cfg.previewers[0].cmd, "text-renderer --color=always");
         // User plugins come after the built-in ones.
         assert_eq!(cfg.plugins.last().unwrap().name, "git status");
         assert_eq!(cfg.keys, vec![("quit".to_string(), "Q".to_string())]);
@@ -787,126 +658,84 @@ requires = ["fzf", "find"]
     }
 
     #[test]
-    fn kitim_plugin_is_off_until_enabled_and_yields_to_user_rules() {
+    fn previews_have_no_external_commands_until_configured() {
         let cfg = Config::default();
-        assert!(!cfg.preview.kitim && cfg.previewers.is_empty());
-
-        let mut cfg = Config::default();
-        let t: toml::Table = r#"
-[preview]
-kitim = true
-
-[[previewer]]
-match = ["*.png"]
-run = "my-viewer"
-graphics = true
-"#
-        .parse()
-        .unwrap();
-        assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 2);
-        assert_eq!(cfg.previewers[0].cmd, "my-viewer");
-        assert!(cfg.previewers[0].graphics);
-        let kitim = &cfg.previewers[1];
-        assert_eq!((kitim.cmd.as_str(), kitim.graphics, kitim.vivid), ("kitim --preview", true, false));
-        assert_eq!(kitim.scope, PreviewerScope::Kitty);
-        assert!(!cfg.preview.kitim_sound);
-        for name in ["*.jpg", "*.JPG", "*.mp4", "*.MOV", "*.gif"] {
-            assert!(kitim.patterns.iter().any(|p| p == name), "{name}");
-        }
-    }
-
-    #[test]
-    fn kitim_sound_adds_the_sound_flag() {
-        let mut cfg = Config::default();
-        let t: toml::Table = "[preview]\nkitim = true\nkitim_sound = true\n".parse().unwrap();
-        assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.last().unwrap().cmd, "kitim --sound --preview");
-        assert_eq!(cfg.previewers.len(), 1);
-        // Without the plugin enabled, the sound switch adds nothing.
-        let mut cfg = Config::default();
-        let t: toml::Table = "[preview]\nkitim_sound = true\n".parse().unwrap();
-        assert!(cfg.apply_table(&t).is_empty());
         assert!(cfg.previewers.is_empty());
-    }
+        assert!(cfg.openers.is_empty());
+        assert!(!cfg.preview.vivido);
 
-    #[test]
-    fn kitpdf_plugin_is_opt_in_and_custom_rules_take_precedence() {
-        let mut cfg = Config::default();
-        assert!(!cfg.preview.kitpdf);
-        let t: toml::Table = r#"
-[preview]
-kitpdf = true
-[[previewer]]
-match = ["*.pdf"]
-run = "custom --preview"
-graphics = true
-interactive = true
-"#
-        .parse()
-        .unwrap();
-        assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 2);
-        assert_eq!(cfg.previewers[0].cmd, "custom --preview");
-        let rule = &cfg.previewers[1];
-        assert_eq!(rule.cmd, "kitpdf --preview");
-        assert!(rule.graphics && rule.interactive && !rule.vivid);
-        assert_eq!(rule.patterns, ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]);
-        let t: toml::Table = "[[previewer]]\nmatch=['*.pdf']\nrun='bad'\ninteractive=true".parse().unwrap();
-        assert!(!Config::default().apply_table(&t).is_empty());
-        let t: toml::Table = "[[previewer]]\nmatch=['*.pdf']\nrun='both'\ngraphics=true\nvivid=true".parse().unwrap();
-        assert!(!Config::default().apply_table(&t).is_empty());
-        let mut cfg = Config::default();
-        let mine = "[[previewer]]\nmatch=['*.pdf']\nrun='mine'\nvivid=true\ninteractive=true";
-        let t: toml::Table = mine.parse().unwrap();
-        assert!(cfg.apply_table(&t).is_empty());
-        assert!(cfg.previewers[0].vivid && cfg.previewers[0].interactive);
-    }
-
-    #[test]
-    fn terminal_profiles_add_only_their_explicit_viewers() {
         let mut cfg = Config::default();
         let t = r#"
-[preview.kitty]
-kitim = true
-kitim_sound = true
-kitpdf = true
+[[preview.kitty.previewer]]
+match = ["*.custom"]
+run = "any-program --sound --custom-flag"
+graphics = true
+interactive = true
 
-[preview.vivido]
-vivi = true
-vivi_sound = true
-vvrd = true
+[[preview.vivido.previewer]]
+match = ["*.something-else"]
+run = "/custom/path/to/a-program --anything"
+vivid = true
 "#
         .parse()
         .unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert!(cfg.preview.vivido);
-        assert_eq!(cfg.previewers.len(), 4);
-        let vivi = &cfg.previewers[0];
-        assert_eq!(vivi.cmd, "vivi --sound --preview");
-        assert!(vivi.vivid && !vivi.graphics && !vivi.interactive);
-        assert_eq!(vivi.scope, PreviewerScope::Vivido);
-        assert_eq!(vivi.patterns, cfg.previewers[2].patterns);
-        let vvrd = &cfg.previewers[1];
-        assert_eq!(vvrd.cmd, "vvrd --preview");
-        assert!(vvrd.vivid && vvrd.interactive && !vvrd.graphics);
-        for name in ["*.pdf", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.markdown"] {
-            assert!(vvrd.patterns.iter().any(|p| p == name), "{name}");
-        }
-        assert_eq!(cfg.previewers[2].cmd, "kitim --sound --preview");
-        assert_eq!(cfg.previewers[3].cmd, "kitpdf --preview");
+        assert_eq!(cfg.previewers.len(), 2);
+        assert_eq!(cfg.previewers[0].patterns, ["*.something-else"]);
+        assert_eq!(
+            cfg.previewers[0].cmd,
+            "/custom/path/to/a-program --anything"
+        );
+        assert_eq!(cfg.previewers[0].scope, PreviewerScope::Vivido);
+        assert!(cfg.previewers[0].vivid && !cfg.previewers[0].graphics);
+        assert_eq!(cfg.previewers[1].patterns, ["*.custom"]);
+        assert_eq!(cfg.previewers[1].cmd, "any-program --sound --custom-flag");
+        assert_eq!(cfg.previewers[1].scope, PreviewerScope::Kitty);
+        assert!(cfg.previewers[1].graphics && cfg.previewers[1].interactive);
     }
 
     #[test]
-    fn kitty_profile_overrides_legacy_switches_without_duplicate_rules() {
+    fn preview_settings_reject_program_specific_switches_as_unknown_keys() {
+        for section in ["preview", "preview.kitty", "preview.vivido"] {
+            let mut cfg = Config::default();
+            let t = format!("[{section}]\nmy_viewer = true\n").parse().unwrap();
+            assert_eq!(
+                cfg.apply_table(&t),
+                [format!("[{section}]: unknown setting `my_viewer`")]
+            );
+            assert!(cfg.previewers.is_empty());
+        }
+    }
+
+    #[test]
+    fn previewer_lists_reject_invalid_shapes_in_every_scope() {
+        for prefix in ["", "preview.kitty.", "preview.vivido."] {
+            let section = format!("{prefix}previewer");
+            for (value, error) in [
+                ("{}", "must be an array of tables"),
+                ("[false]", "must contain tables"),
+            ] {
+                let mut cfg = Config::default();
+                let t = format!("{section} = {value}").parse().unwrap();
+                assert_eq!(cfg.apply_table(&t), [format!("[[{section}]] {error}")]);
+                assert!(cfg.previewers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn example_config_defines_its_own_commands_and_file_patterns() {
         let mut cfg = Config::default();
-        let t = "[preview]\nkitim=true\nkitpdf=true\n[preview.kitty]\nkitim=false\n"
-            .parse()
-            .unwrap();
+        let t = include_str!("../config.example.toml").parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 1);
-        assert_eq!(cfg.previewers[0].cmd, "kitpdf --preview");
-        assert!(!cfg.preview.vivido);
+        assert!(cfg.preview.vivido);
+        assert_eq!(cfg.previewers.len(), 5);
+        assert!(
+            cfg.previewers
+                .iter()
+                .all(|r| !r.patterns.is_empty() && !r.cmd.is_empty())
+        );
     }
 
     #[test]
@@ -946,33 +775,12 @@ vvrd = true
     }
 
     #[test]
-    fn bat_highlighting_is_on_unless_disabled() {
-        assert!(Config::default().preview.bat);
-        let mut cfg = Config::default();
-        let t: toml::Table = "[preview]\nbat = false\n".parse().unwrap();
-        assert!(cfg.apply_table(&t).is_empty());
-        assert!(!cfg.preview.bat);
-    }
-
-    #[test]
-    fn preview_line_numbers_default_on_and_follow_config() {
-        let mut cfg = Config::default();
-        assert!(cfg.preview.line_numbers);
-        for enabled in [false, true] {
-            let t: toml::Table = format!("[preview]\nline_numbers = {enabled}\n").parse().unwrap();
-            assert!(cfg.apply_table(&t).is_empty());
-            assert_eq!(cfg.preview.line_numbers, enabled);
-            assert!(cfg.preview.bat);
-        }
-    }
-
-    #[test]
-    fn opener_rules_parse_and_kitim_media_types() {
+    fn opener_rules_parse_arbitrary_commands_and_patterns() {
         let mut cfg = Config::default();
         let t: toml::Table = r#"
 [[opener]]
 match = ["*.pdf", "*.PDF"]
-run = "kitpdf -z 2"
+run = "document-reader --zoom 2"
 
 [[opener]]
 run = "no patterns"
@@ -981,21 +789,11 @@ run = "no patterns"
         .unwrap();
         let errs = cfg.apply_table(&t);
         assert_eq!(cfg.openers.len(), 1);
-        assert_eq!((cfg.openers[0].cmd.as_str(), cfg.openers[0].patterns.len()), ("kitpdf -z 2", 2));
+        assert_eq!(
+            (cfg.openers[0].cmd.as_str(), cfg.openers[0].patterns.len()),
+            ("document-reader --zoom 2", 2)
+        );
         assert_eq!(errs, ["[[opener]] missing `match`"]);
-
-        for name in ["a.PNG", "b.mp4", "c.MOV", "song.flac", "x.jpeg"] {
-            assert!(is_kitim_media(name), "{name}");
-        }
-        for name in ["x.txt", "png", "a.mp4x", "archive.tar.gz", ".png"] {
-            assert!(!is_kitim_media(name), "{name}");
-        }
-        for name in ["a.PDF", "b.epub", "c.svg", "README.md", "notes.Markdown"] {
-            assert!(is_vvrd_document(name), "{name}");
-        }
-        for name in ["a.png", "x.txt", ".md", "svg"] {
-            assert!(!is_vvrd_document(name), "{name}");
-        }
     }
 
     #[test]

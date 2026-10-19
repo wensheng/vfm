@@ -1,0 +1,66 @@
+# Copy to ~/.config/vfm/config.toml (or use vfm --config PATH).
+# These programs and extensions are examples, not built-in vfm defaults.
+# Install the commands you choose, or replace their run strings and patterns.
+
+[preview]
+enabled = true
+debounce_ms = 40
+max_bytes = 262144
+
+# Kitty graphics terminals, including kitty, Ghostty, and cmux.
+[[preview.kitty.previewer]]
+match = [
+    "*.png", "*.PNG", "*.jpg", "*.JPG", "*.jpeg", "*.JPEG",
+    "*.gif", "*.GIF", "*.webp", "*.WEBP", "*.bmp", "*.BMP",
+    "*.ico", "*.ICO", "*.tif", "*.TIF", "*.tiff", "*.TIFF",
+    "*.tga", "*.TGA", "*.qoi", "*.QOI", "*.pnm", "*.PNM",
+    "*.ppm", "*.PPM", "*.pgm", "*.PGM", "*.pbm", "*.PBM",
+    "*.mp4", "*.MP4", "*.m4v", "*.M4V", "*.mkv", "*.MKV",
+    "*.webm", "*.WEBM", "*.mov", "*.MOV", "*.avi", "*.AVI",
+    "*.wmv", "*.WMV", "*.flv", "*.FLV", "*.mpg", "*.MPG",
+    "*.mpeg", "*.MPEG", "*.3gp", "*.3GP",
+]
+run = "kitim --preview"  # Add --sound here to enable video audio.
+graphics = true
+
+[[preview.kitty.previewer]]
+match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]
+run = "kitpdf --preview"
+graphics = true
+interactive = true
+
+# Vivido and Vivida use these rules instead of the Kitty profile.
+# Remove both Vivido rules to inherit the Kitty profile, or leave an empty
+# [preview.vivido] table to disable that inheritance.
+[[preview.vivido.previewer]]
+match = [
+    "*.png", "*.PNG", "*.jpg", "*.JPG", "*.jpeg", "*.JPEG",
+    "*.gif", "*.GIF", "*.webp", "*.WEBP", "*.bmp", "*.BMP",
+    "*.ico", "*.ICO", "*.tif", "*.TIF", "*.tiff", "*.TIFF",
+    "*.tga", "*.TGA", "*.qoi", "*.QOI", "*.pnm", "*.PNM",
+    "*.ppm", "*.PPM", "*.pgm", "*.PGM", "*.pbm", "*.PBM",
+    "*.mp4", "*.MP4", "*.m4v", "*.M4V", "*.mkv", "*.MKV",
+    "*.webm", "*.WEBM", "*.mov", "*.MOV", "*.avi", "*.AVI",
+    "*.wmv", "*.WMV", "*.flv", "*.FLV", "*.mpg", "*.MPG",
+    "*.mpeg", "*.MPEG", "*.3gp", "*.3GP",
+]
+run = "vivi --preview"  # Add --sound here to enable video audio.
+vivid = true
+
+[[preview.vivido.previewer]]
+match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.MD", "*.markdown", "*.MARKDOWN", "*.mkd", "*.MKD"]
+run = "vvrd --preview"
+vivid = true
+interactive = true
+
+# Shared text rule. This example wrapper requires a POSIX sh and bat.
+# vfm appends PATH WIDTH HEIGHT; the wrapper passes only PATH to bat.
+# Replace -n with -p to remove line numbers; all options belong to the command.
+[[previewer]]
+match = ["*.txt", "*.TXT", "*.rs", "*.toml", "*.md", "*.MD", "*.py", "*.js", "*.json", "*.yaml", "*.yml"]
+run = """sh -c 'exec bat --color=always --decorations=always --paging=never --wrap=never --line-range=:20001 -n -- "$1"' sh"""
+
+# Fullscreen openers are independent rules, for example:
+# [[opener]]
+# match = ["*.pdf", "*.PDF"]
+# run = "my-document-reader --fullscreen"
