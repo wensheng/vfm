@@ -90,6 +90,13 @@ pub struct Pin {
 /// would cap it at 33 fps and add judder to 24 and 30 fps video.
 const ANIMATION_TICK: Duration = Duration::from_millis(15);
 
+/// Narrowest the file list or the preview pane gets, in columns, however
+/// far the divider moves, so neither pane is dragged out of sight.
+const MIN_SIDE_COLS: u16 = 20;
+
+/// `<` / `>` steps across the screen width: 5% per press.
+const DIVIDER_STEPS: u16 = 20;
+
 /// The preview image on screen: which frame, where, and its id for deleting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Shown {
@@ -241,10 +248,15 @@ pub struct App {
     pub screen: Screen,
     pub events: Box<dyn EventSource>,
     pub preview: Preview,
-    /// Keyboard navigation currently scrolls the text preview.
+    /// Keyboard navigation currently scrolls or turns pages in the preview.
     preview_focused: bool,
     /// Offset in wrapped display rows, not source lines.
     preview_scroll: usize,
+    /// The preview's share of the screen width, divider included, in
+    /// thousandths: fine enough that a drag lands on the exact column.
+    preview_share: u16,
+    /// The left button went down on the preview divider and is still held.
+    dragging: bool,
     pub mode: Mode,
     pub input: InputLine,
     /// Statusbar message with 3s expiry.
@@ -311,7 +323,8 @@ impl App {
             cfg.preview.max_bytes,
         );
         preview.enabled = cfg.ui.preview && cfg.preview.enabled;
-        preview.highlight = crate::preview::bat_argv(cfg.preview.bat, plugin::which);
+        preview.highlight = crate::preview::bat_argv(cfg.preview.bat, cfg.preview.line_numbers, plugin::which);
+        let preview_share = cfg.ui.preview_width * 10; // percent → thousandths
         let mut app = App {
             detail: cfg.ui.detail,
             ctx_active: 1,
@@ -325,6 +338,8 @@ impl App {
             preview,
             preview_focused: false,
             preview_scroll: 0,
+            preview_share,
+            dragging: false,
             mode: Mode::Normal,
             input: InputLine::default(),
             msg: None,
@@ -356,9 +371,27 @@ impl App {
 
     // ------------------------------------------------------------ loop
 
+    /// Adopts the host terminal's category and its probe, from [`term::detect`].
+    ///
+    /// Vivid is known from the environment at once, so its previewers take
+    /// over the pane now rather than after the probe.
+    pub fn set_term(&mut self, kind: term::Kind, probe: Option<term::Probe>) {
+        let before = self.hovered_rule();
+        (self.term, self.probe) = (kind, probe);
+        if self.hovered_rule() != before {
+            self.preview_supersede();
+        }
+    }
+
+    /// The previewer rule for the hovered entry, as the terminal now stands.
+    fn hovered_rule(&self) -> Option<usize> {
+        self.dir.hovered_name().and_then(|name| self.match_previewer(name))
+    }
+
     pub fn run(&mut self) -> Flow {
         let flow = self.event_loop();
-        // Images outlive vfm's text unless deleted.
+        // Images outlive vfm's text unless deleted; Vivid pictures, their previewer.
+        self.preview.stop();
         self.hide_graphics();
         self.screen.flush();
         flow
@@ -404,10 +437,12 @@ impl App {
     /// Records the terminal probe's verdict and replays the keys it swallowed.
     fn settle_term(&mut self, report: term::Report) -> Option<Flow> {
         self.probe = None;
+        let before = self.hovered_rule();
         self.graphics = report.graphics;
         self.term = self.term.settle(report.graphics);
-        // Graphics previewers were skipped until now; re-pick the hovered one.
-        if self.graphics && self.cfg.previewers.iter().any(|r| r.graphics) {
+        // Graphics previewers were skipped until now; re-pick the hovered
+        // one if that changes it. A running Vivid preview keeps going.
+        if self.hovered_rule() != before {
             self.preview_supersede();
         }
         report.typeahead.into_iter().find_map(|k| self.handle_event(Event::Key(k)))
@@ -540,6 +575,11 @@ impl App {
     fn mouse_action(&mut self, m: MouseEvent) -> Action {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // A press on the divider starts a drag, never half a double click.
+                if self.on_divider(m.row, m.column) {
+                    self.last_click = None;
+                    return Action::Click { row: m.row, col: m.column, kind: ClickKind::Single };
+                }
                 let now = Instant::now();
                 let double = self
                     .last_click
@@ -556,7 +596,9 @@ impl App {
             }
             MouseEventKind::ScrollUp => Action::Click { row: m.row, col: m.column, kind: ClickKind::WheelUp },
             MouseEventKind::ScrollDown => Action::Click { row: m.row, col: m.column, kind: ClickKind::WheelDown },
-            _ => Action::Resize, // Drag/Up/Moved: ignored; Resize = no-op action
+            MouseEventKind::Drag(MouseButton::Left) => Action::Click { row: m.row, col: m.column, kind: ClickKind::Drag },
+            MouseEventKind::Up(MouseButton::Left) => Action::Click { row: m.row, col: m.column, kind: ClickKind::Release },
+            _ => Action::Resize, // Moved, other buttons: ignored; Resize = no-op action
         }
     }
 
@@ -679,6 +721,8 @@ impl App {
                 }
                 self.dirty = Dirty::Full;
             }
+            Action::PreviewWider => self.step_divider(true),
+            Action::PreviewNarrower => self.step_divider(false),
             Action::AutoNext => {
                 self.auto_next = !self.auto_next;
                 self.notify(format!("auto-advance {}", on_off(self.auto_next)));
@@ -843,6 +887,10 @@ impl App {
             Action::PgUp => self.move_cursor(-(self.screen.list_rows() as isize)),
             Action::Home => self.set_cursor(0),
             Action::End => self.set_cursor(self.dir.nvisible().saturating_sub(1)),
+            // The divider can be dragged while filtering too.
+            Action::Click { row, col, kind: kind @ (ClickKind::Single | ClickKind::Drag | ClickKind::Release) } => {
+                self.on_click(row, col, kind)
+            }
             Action::Click { row, .. } => self.on_click(row, 0, ClickKind::Single),
             Action::Quit => return Some(Flow::Quit(0)),
             _ => {}
@@ -1084,16 +1132,14 @@ impl App {
         } else if matches!(self.mode, Mode::Normal)
             && self.preview_pane().is_some()
             && self.preview_pin.is_none()
-            && self.preview.image().is_none()
-            && !self
-                .dir
-                .hovered_name()
-                .and_then(|n| self.match_previewer(n))
-                .is_some_and(|i| self.cfg.previewers[i].graphics)
-            && self
-                .dir
-                .hovered_path()
-                .is_some_and(|p| crate::preview::opens_as_text(&p))
+            && (self.preview.is_interactive()
+                || (self.preview.image().is_none()
+                    && !self
+                        .dir
+                        .hovered_name()
+                        .and_then(|n| self.match_previewer(n))
+                        .is_some_and(|i| self.cfg.previewers[i].graphics || self.cfg.previewers[i].vivid)
+                    && self.dir.hovered_path().is_some_and(|p| crate::preview::opens_as_text(&p))))
         {
             self.preview_focused = true;
             self.dirty = Dirty::Full;
@@ -1115,7 +1161,7 @@ impl App {
             self.suspend_and_run(&format!("./{}", shquote(&file)), vec![]);
             return None;
         }
-        match self.file_open(&path, &name, plugin::which("kitim")) {
+        match self.file_open(&path, &name, &plugin::which) {
             FileOpen::Program(cmdline) => self.suspend_and_run(&cmdline, vec![]),
             FileOpen::Edit => self.external_edit(),
             FileOpen::Nothing => {}
@@ -1126,12 +1172,13 @@ impl App {
     /// What Enter does with a hovered file.
     ///
     /// A matching `[[opener]]` rule runs fullscreen, first match winning.
-    /// Otherwise kitim plays images, video and audio — `kitim_installed` is
-    /// passed in so tests decide it — but only on a terminal that answered
-    /// the graphics probe, since kitim would show nothing without it. What's
-    /// left opens in the editor if its head reads as text, else nothing: no
-    /// more vi over binary bytes.
-    fn file_open(&self, path: &Path, name: &str, kitim_installed: bool) -> FileOpen {
+    /// Inside Vivid, vvrd reads PDF, EPUB, SVG and Markdown, and vivi shows
+    /// images, video and audio. Otherwise kitim plays the media, but only on
+    /// a terminal that answered the graphics probe, since kitim would show
+    /// nothing without it. Each viewer must be `installed` — passed in so
+    /// tests decide it. What's left opens in the editor if its head reads as
+    /// text, else nothing: no more vi over binary bytes.
+    fn file_open(&self, path: &Path, name: &str, installed: &dyn Fn(&str) -> bool) -> FileOpen {
         if let Some(rule) = self
             .cfg
             .openers
@@ -1140,7 +1187,17 @@ impl App {
         {
             return FileOpen::Program(format!("{} {}", rule.cmd.trim(), shquote(&file_name_of(path))));
         }
-        if self.graphics && kitim_installed && crate::config::is_kitim_media(name) {
+        let file = || shquote(&file_name_of(path));
+        if self.term == term::Kind::Vivid {
+            if crate::config::is_vvrd_document(name) && installed("vvrd") {
+                return FileOpen::Program(format!("vvrd {}", file()));
+            }
+            if crate::config::is_kitim_media(name) && installed("vivi") {
+                // --fullscreen: images fill the window and wait for a key.
+                return FileOpen::Program(format!("vivi --fullscreen {}", file()));
+            }
+        }
+        if self.graphics && installed("kitim") && crate::config::is_kitim_media(name) {
             // --fullscreen: images fill the screen and wait for a key, so
             // the viewer doesn't flash and vanish.
             let file = shquote(&file_name_of(path));
@@ -1165,8 +1222,9 @@ impl App {
         env.extend(extra_env);
         // Re-entering the alternate screen wipes images; render() re-sends.
         self.hide_graphics();
-        // Stop the previewer meanwhile: a video would keep playing its sound.
-        self.preview.disable();
+        // Stop the previewer meanwhile: a video would keep playing its sound,
+        // and a Vivid one would draw over the program.
+        self.preview.stop();
         self.screen.flush();
         self.screen.leave();
         let res = plugin::run_fullscreen(cmdline, &dir, &env);
@@ -1514,6 +1572,20 @@ impl App {
 
     /// Consume navigation while the preview owns keyboard focus.
     fn apply_preview(&mut self, action: &Action) -> bool {
+        if self.preview.is_interactive() {
+            let command = match action {
+                Action::Next | Action::PgDn | Action::HalfPgDn | Action::NavIn => Some("next\n"),
+                Action::Prev | Action::PgUp | Action::HalfPgUp => Some("prev\n"),
+                Action::Home => Some("first\n"),
+                Action::End => Some("last\n"),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.preview.turn_page(command);
+                self.dirty = Dirty::Full; // Also show a spawn failure during debounce immediately.
+                return true;
+            }
+        }
         let page = self.screen.list_rows();
         let (down, amount) = match action {
             Action::Next => (true, 1),
@@ -1530,10 +1602,38 @@ impl App {
                 return true;
             }
             Action::NavIn | Action::Resize => return true,
+            // Moving the divider keeps the focus. Drags and releases only
+            // ever act on the divider, so they never take the focus away.
+            Action::PreviewWider | Action::PreviewNarrower => {
+                self.step_divider(*action == Action::PreviewWider);
+                return true;
+            }
+            &Action::Click { row, col, kind }
+                if matches!(kind, ClickKind::Drag | ClickKind::Release)
+                    || (kind == ClickKind::Single && self.on_divider(row, col)) =>
+            {
+                self.on_click(row, col, kind);
+                return true;
+            }
             _ => return false,
         };
-        let Some((width, _)) = self.preview_pane() else {
+        if self.preview_pane().is_none() {
             return false;
+        }
+        self.preview_scroll = if down {
+            self.preview_scroll.saturating_add(amount)
+        } else {
+            self.preview_scroll.saturating_sub(amount)
+        }
+        .min(self.preview_max_scroll());
+        self.dirty = Dirty::Full;
+        true
+    }
+
+    /// Furthest the preview scrolls: its wrapped rows less one page.
+    fn preview_max_scroll(&self) -> usize {
+        let Some((width, _)) = self.preview_pane() else {
+            return 0;
         };
         let total = self.preview.lines().map_or(0, |(lines, _)| {
             lines
@@ -1541,14 +1641,7 @@ impl App {
                 .map(|line| wrap_line(line, usize::from(width).saturating_sub(2)).len())
                 .sum::<usize>()
         });
-        self.preview_scroll = if down {
-            self.preview_scroll.saturating_add(amount)
-        } else {
-            self.preview_scroll.saturating_sub(amount)
-        }
-        .min(total.saturating_sub(page));
-        self.dirty = Dirty::Full;
-        true
+        total.saturating_sub(self.screen.list_rows())
     }
 
     fn preview_supersede(&mut self) {
@@ -1564,14 +1657,69 @@ impl App {
         self.screen.w >= 100 && self.screen.h >= 10
     }
 
+    /// The preview pane's width right of the divider, and its height, when
+    /// the pane is showing.
     fn preview_pane(&self) -> Option<(u16, u16)> {
         let (w, h) = (self.screen.w, self.screen.h);
-        (self.preview.enabled && self.pane_fits()).then(|| (w / 2 - 1, h.saturating_sub(4)))
+        (self.preview.enabled && self.pane_fits())
+            .then(|| (w.saturating_sub(divider_col(w, self.preview_share) + 1), h.saturating_sub(4)))
+    }
+
+    /// The screen column of the divider, when the pane is showing.
+    fn divider(&self) -> Option<u16> {
+        self.preview_pane().map(|(pane_w, _)| self.screen.w - pane_w - 1)
+    }
+
+    /// A press at `(row, col)` grabs the divider: the divider itself or the
+    /// blank column after it, in a mode that shows the pane.
+    fn on_divider(&self, row: u16, col: u16) -> bool {
+        let Some(divider) = self.divider() else { return false };
+        matches!(self.mode, Mode::Normal | Mode::Filter)
+            && (1..self.screen.h.saturating_sub(1)).contains(&row)
+            && (divider..=divider + 1).contains(&col)
+    }
+
+    /// Moves the divider to `col`, as far as both panes keep their minimum
+    /// width. Previewers rerun once it settles, not on every step of a drag.
+    fn move_divider(&mut self, col: u16) {
+        let w = self.screen.w;
+        let col = clamp_divider(w, col);
+        if self.divider().is_some_and(|d| d != col) {
+            self.preview_share = share_at(w, col);
+            self.dirty = Dirty::Full;
+        }
+    }
+
+    /// `<` / `>`: moves the divider one step left (wider preview) or right.
+    fn step_divider(&mut self, wider: bool) {
+        let Some(divider) = self.divider() else {
+            self.notify("no preview pane");
+            return;
+        };
+        let step = (self.screen.w / DIVIDER_STEPS).max(1);
+        self.move_divider(if wider { divider.saturating_sub(step) } else { divider + step });
+        self.settle_divider();
+    }
+
+    /// The divider stopped: keep the scroll within the rewrapped text, and
+    /// rerun previewers whose output depends on the pane size.
+    fn settle_divider(&mut self) {
+        if self.preview_scroll > 0 {
+            self.preview_scroll = self.preview_scroll.min(self.preview_max_scroll());
+        }
+        self.request_preview();
+        self.dirty = Dirty::Full;
     }
 
     fn preview_on_hover(&mut self) {
         self.preview_focused = false;
         self.preview_scroll = 0;
+        self.request_preview();
+    }
+
+    /// Asks for the hovered entry's preview (or the pinned plugin's output)
+    /// at the current pane size. A no-op while that is already showing.
+    fn request_preview(&mut self) {
         if !self.preview.enabled {
             return;
         }
@@ -1586,15 +1734,27 @@ impl App {
         };
         let Some(path) = self.dir.hovered_path() else { return };
         let rule = self.match_previewer(&e.name);
-        let sig = make_sig(&path, e.size, e.mtime, (pw, self.screen.h), rule.unwrap_or(usize::MAX));
+        // The whole screen size: a Vivid picture's grid position depends on
+        // it, not just the pane's size. Only previewer rules are given the
+        // pane's width; built-in text is wrapped as it renders, so it stays
+        // put while the divider moves.
+        let layout = [self.screen.w, self.screen.h, pw];
+        let layout = if rule.is_some() { &layout[..] } else { &layout[..2] };
+        let sig = make_sig(&path, e.size, e.mtime, layout, rule.unwrap_or(usize::MAX));
         let mut pane = (pw, self.screen.h);
         let source = match rule.map(|i| &self.cfg.previewers[i]) {
             Some(r) => {
                 let argv = crate::util::shlex(&r.cmd).unwrap_or_else(|| vec![r.cmd.clone()]);
-                if r.graphics {
+                if r.graphics || r.vivid {
                     // Exactly the body: an image may fill every cell it's given.
                     pane = (pw - 1, self.screen.list_rows() as u16);
-                    Source::Graphics(argv)
+                }
+                if r.vivid {
+                    // Where sync_graphics puts kitty images: column, then row.
+                    let origin = (self.screen.w - pw + 1, 2);
+                    Source::Vivid { argv, origin, interactive: r.interactive }
+                } else if r.graphics {
+                    if r.interactive { Source::InteractiveGraphics(argv) } else { Source::Graphics(argv) }
                 } else {
                     Source::Previewer(argv)
                 }
@@ -1619,7 +1779,7 @@ impl App {
         let source = Source::Shell(cmdline.to_string());
         let pane = (pane_w, self.screen.h);
         // Distinct from any hover sig (rule ids are < previewers.len()).
-        let sig = make_sig(&self.dir.path, plugin as u64, 0, pane, usize::MAX - 1);
+        let sig = make_sig(&self.dir.path, plugin as u64, 0, &[pane.0, pane.1], usize::MAX - 1);
         let hovered = self.dir.hovered_path();
         let sel = (!self.sel.is_empty()).then(|| self.sel.file.clone());
         let env = plugin::child_env(&self.dir.path, hovered.as_deref(), sel.as_deref(), self.ctx_i as u8);
@@ -1651,10 +1811,10 @@ impl App {
         self.dirty = Dirty::Full;
     }
 
-    /// First rule matching `name`; graphics rules only if the terminal can.
+    /// First matching rule in the selected terminal profile or shared fallbacks.
     fn match_previewer(&self, name: &str) -> Option<usize> {
         self.cfg.previewers.iter().position(|r| {
-            (self.graphics || !r.graphics)
+            r.supports(self.term, self.graphics, self.cfg.preview.vivido)
                 && r.patterns
                     .iter()
                     .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
@@ -1766,8 +1926,18 @@ impl App {
 
     // ---- mouse
 
-    fn on_click(&mut self, row: u16, _col: u16, kind: ClickKind) {
+    fn on_click(&mut self, row: u16, col: u16, kind: ClickKind) {
         match kind {
+            ClickKind::Single if self.on_divider(row, col) => {
+                self.dragging = true;
+                self.dirty = Dirty::Full; // highlights the divider, takes images down
+            }
+            ClickKind::Drag if self.dragging => self.move_divider(col),
+            ClickKind::Release if self.dragging => {
+                self.dragging = false;
+                self.settle_divider();
+            }
+            ClickKind::Drag | ClickKind::Release => {}
             ClickKind::WheelUp => self.move_cursor(-1),
             ClickKind::WheelDown => self.move_cursor(1),
             ClickKind::Right => {
@@ -1777,6 +1947,10 @@ impl App {
                 }
             }
             ClickKind::Single => {
+                // A drag whose release got lost ends here.
+                if std::mem::take(&mut self.dragging) {
+                    self.settle_divider();
+                }
                 if let Some(i) = self.row_to_index(row) {
                     self.set_cursor(i);
                 }
@@ -1824,10 +1998,11 @@ impl App {
     }
 
     /// Top-left cell of the pane body while an image may show there: the
-    /// pane is open and no overlay (menu, pager) covers it.
+    /// pane is open, no overlay (menu, pager) covers it, and the divider
+    /// isn't being dragged (the image is sized for where the drag began).
     fn graphics_origin(&self) -> Option<(u16, u16)> {
         let (pane_w, _) = self.preview_pane()?;
-        if matches!(self.mode, Mode::Menu(_) | Mode::Pager { .. }) {
+        if self.dragging || matches!(self.mode, Mode::Menu(_) | Mode::Pager { .. }) {
             return None;
         }
         Some((2, self.screen.w - pane_w + 1))
@@ -1842,6 +2017,8 @@ impl App {
     /// so every image is cleared before it goes up.
     fn sync_graphics(&mut self) {
         let origin = self.graphics_origin();
+        // A Vivid previewer draws by itself; it only needs to know when to hide.
+        self.preview.set_covered(origin.is_none());
         let frame = origin.and(self.preview.image());
         let old = self.shown;
         if old.map(|s| (s.seq, Some(s.origin))) == frame.map(|(seq, _)| (seq, origin)) {
@@ -1917,13 +2094,12 @@ impl App {
         self.last_cursor = self.dir.cursor;
     }
 
-    /// Playable width of the entry pane (halved when preview is open).
+    /// Playable width of the entry pane: up to the divider when the preview
+    /// is open.
     fn pane_width(&self) -> usize {
-        let w = self.screen.w as usize;
-        if self.preview_pane().is_some() {
-            (w / 2 - 1).max(20)
-        } else {
-            w.max(20)
+        match self.divider() {
+            Some(divider) => usize::from(divider),
+            None => usize::from(self.screen.w).max(20),
         }
     }
 
@@ -1938,7 +2114,7 @@ impl App {
         // Row 0: context bar.
         self.ctxbar(&theme);
 
-        // Row 1: path (left pane only when the preview owns the right half).
+        // Row 1: path (left pane only when the preview owns the right side).
         let pw = self.pane_width();
         let shown = tilde_path(&self.dir.path, self.home.as_deref());
         let path_line = Line::plain(shown);
@@ -1970,7 +2146,7 @@ impl App {
             self.screen.put_text(2, 0, text, theme.divider, pw);
         }
 
-        // Preview pane (right half).
+        // Preview pane (right of the divider).
         if let Some((pane_w, _)) = self.preview_pane() {
             self.render_preview(pane_w as usize);
         }
@@ -2105,10 +2281,14 @@ impl App {
         let theme = self.cfg.theme.clone();
         let h = self.screen.h;
         let x = (self.screen.w as usize).saturating_sub(pane_w);
-        let focus_style = if self.preview_focused { theme.cursor } else { theme.divider };
-        // Divider.
+        let focus_style = if self.preview_focused || self.dragging { theme.cursor } else { theme.divider };
+        // Divider, and the body's padding column after it: blank it, since
+        // it held listing or preview text before the divider last moved.
         for r in 1..h.saturating_sub(1) {
             self.screen.put_text(r, x.saturating_sub(1) as u16, "│", focus_style, 1);
+            if r > 1 {
+                self.screen.put_text(r, x as u16, " ", Style::default(), 1);
+            }
         }
         // Header: hovered name (or the pinned plugin and its dir) + state.
         let name = match self.preview_pin.and_then(|p| self.cfg.plugins.get(p.plugin)) {
@@ -2119,7 +2299,9 @@ impl App {
         let state = match (&self.preview.state, self.preview.error()) {
             (_, Some(e)) => format!("error: {e}"),
             // A running job with a frame up is playing, not loading.
-            (crate::preview::PreviewState::Running { .. }, _) if image.is_none() => "…".into(),
+            (crate::preview::PreviewState::Running { .. }, _) if image.is_none() && !self.preview.is_vivid() => {
+                "…".into()
+            }
             (crate::preview::PreviewState::Debounce { .. }, _) => "…".into(),
             _ => String::new(),
         };
@@ -2130,7 +2312,15 @@ impl App {
         if self.preview_focused {
             meta.spans.insert(
                 0,
-                Span { text: " [FOCUSED: Esc/Left exits] ".into(), style: theme.cursor },
+                Span {
+                    text: if self.preview.is_interactive() {
+                        " [FOCUSED: j/k pages, Esc/Left exits] "
+                    } else {
+                        " [FOCUSED: Esc/Left exits] "
+                    }
+                    .into(),
+                    style: theme.cursor,
+                },
             );
         }
         if let Some((_, truncated)) = self.preview.lines() {
@@ -2183,6 +2373,25 @@ fn input_event(k: KeyEvent) -> Option<InputEv> {
         KeyCode::End => InputEv::End,
         _ => return None,
     })
+}
+
+/// Keeps a divider at `col` where both panes get `MIN_SIDE_COLS`.
+fn clamp_divider(w: u16, col: u16) -> u16 {
+    col.max(MIN_SIDE_COLS).min(w.saturating_sub(MIN_SIDE_COLS + 1))
+}
+
+/// The divider's column on a `w`-column screen when the preview takes
+/// `share` thousandths of it, the divider included.
+fn divider_col(w: u16, share: u16) -> u16 {
+    let cols = u32::from(w) * u32::from(share.min(1000)) / 1000;
+    clamp_divider(w, w - u16::try_from(cols).unwrap_or(w))
+}
+
+/// The smallest share that puts the divider at `col`: the inverse of
+/// [`divider_col`] on screens narrower than 1000 columns.
+fn share_at(w: u16, col: u16) -> u16 {
+    let cols = u32::from(w.saturating_sub(col));
+    u16::try_from((cols * 1000).div_ceil(u32::from(w.max(1)))).unwrap_or(1000)
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -2382,6 +2591,7 @@ fn apply_key_config(
         ("cycle_sort", Action::CycleSort), ("reverse_sort", Action::ReverseSort),
         ("cycle_time", Action::CycleTime), ("redraw", Action::Redraw),
         ("toggle_preview", Action::TogglePreview), ("help", Action::Help),
+        ("preview_wider", Action::PreviewWider), ("preview_narrower", Action::PreviewNarrower),
         ("filter", Action::Filter), ("cycle_filter_mode", Action::CycleFilterMode),
         ("select", Action::Select), ("select_mul", Action::SelectMul),
         ("select_all", Action::SelectAll), ("select_invert", Action::SelectInvert),
@@ -2409,7 +2619,7 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "vfm — keys",
         "",
         "  j/k or arrows      move            h/Left       parent dir",
-        "  l/Right            enter dir / focus text preview",
+        "  l/Right            enter dir / focus text or document preview",
         "  Enter              open (dir/media/text)",
         "  g / G              top / bottom    C-d / C-u    half page",
         "  J ±n               jump n rows     C-y          newest entry",
@@ -2424,8 +2634,10 @@ fn help_lines(plugins: &[crate::config::PluginDef]) -> Vec<Line> {
         "  s / C-t            sort key / reverse      T  time type",
         "  .                  show hidden     d            detail toggle",
         "  f                  file info       P            preview toggle",
+        "  < / >              move the preview divider left / right (or drag it)",
         "  ?                  this help",
         "  Focused preview:   Up/Down scroll, PgDn/C-f down, PgUp/C-b up",
+        "  Document preview:  j/k or PgDn/PgUp turn pages, Home/End first/last",
         "                     Esc/Left returns to the file list",
         "",
         "  Space              select + move   m m          range select",
@@ -3084,6 +3296,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn focused_highlighted_preview_scrolls_through_multiple_pages() {
+        let text: String = (0..200).map(|i| format!("row {i:03}\n")).collect();
+        let (mut app, d) = test_app("preview-highlight-scroll");
+        std::fs::write(d.join("alpha"), format!("{text}last row\n")).unwrap();
+        let index = app.dir.entries.iter().position(|e| &*e.name == "alpha").unwrap();
+        app.set_cursor(index);
+        // Emulate bat's line range without depending on an installed highlighter.
+        let script = r#"head -n "${1##*:}" "$3""#;
+        app.preview.highlight = Some(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
+        app.preview.debounce = Duration::ZERO;
+        app.apply(Action::TogglePreview);
+        drive_preview(&mut app);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        let cursor = app.dir.cursor;
+        let path = app.dir.path.clone();
+        let page = app.screen.list_rows();
+        app.handle_event(special(KeyCode::Right));
+        for i in 1..=3 {
+            app.handle_event(ckey('f'));
+            assert_eq!(app.preview_scroll, i * page);
+            app.render();
+            assert!(out.take().contains(&format!("row {:03}", i * page)));
+        }
+        for i in 1..=page + 5 {
+            app.handle_event(special(KeyCode::Down));
+            assert_eq!(app.preview_scroll, 3 * page + i);
+        }
+        app.handle_event(special(KeyCode::End));
+        app.render();
+        assert!(out.take().contains("last row"));
+        let end = app.preview_scroll;
+        app.handle_event(ckey('f'));
+        app.handle_event(special(KeyCode::Down));
+        assert_eq!(app.preview_scroll, end);
+        app.handle_event(ckey('b'));
+        assert_eq!(app.preview_scroll, end - page);
+        app.handle_event(special(KeyCode::Home));
+        assert_eq!(app.preview_scroll, 0);
+        assert!(app.preview_focused);
+        assert_eq!(app.dir.cursor, cursor);
+        assert_eq!(app.dir.path, path);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn document_preview_focus_sends_page_commands_and_cleans_up() {
+        let (mut app, d) = text_preview_app("document-focus", "\0document");
+        let executable = std::env::current_exe().unwrap();
+        app.cfg.previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
+            patterns: vec!["alpha".into()],
+            cmd: format!(
+                "\"{}\" --exact preview::tests::interactive_child --ignored --nocapture --",
+                executable.display()
+            ),
+            graphics: true,
+            vivid: false,
+            interactive: true,
+        }];
+        app.preview_supersede();
+        assert!(!app.preview.is_interactive(), "must wait for Kitty capability");
+        app.graphics = true;
+        app.preview_supersede();
+        assert!(app.preview.is_interactive());
+        let cursor = app.dir.cursor;
+        let path = app.dir.path.clone();
+        // Focus during debounce, then start the child with the first page command.
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        for (event, id) in [
+            (special(KeyCode::PageDown), 2),
+            (special(KeyCode::PageUp), 3),
+            (special(KeyCode::Home), 4),
+            (special(KeyCode::End), 5),
+            (key('j'), 2),
+            (key('k'), 3),
+            (ckey('f'), 2),
+            (ckey('b'), 3),
+            (special(KeyCode::Right), 2),
+        ] {
+            app.handle_event(event);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.preview.image().and_then(|(_, f)| f.id) != Some(id) && Instant::now() < deadline {
+                app.preview.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(app.preview.image().and_then(|(_, f)| f.id), Some(id));
+            assert_eq!(app.dir.cursor, cursor);
+            assert_eq!(app.dir.path, path);
+            assert!(app.preview_focused);
+        }
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.dirty = Dirty::Full;
+        app.render();
+        assert!(out.take().contains("j/k pages"));
+        app.handle_event(special(KeyCode::Left));
+        assert!(!app.preview_focused);
+        assert!(app.preview.is_interactive());
+        app.handle_event(special(KeyCode::Right));
+        app.handle_event(special(KeyCode::Esc));
+        assert!(!app.preview_focused);
+        app.handle_event(special(KeyCode::Right));
+        app.handle_event(Event::Resize(80, 30));
+        assert!(!app.preview_focused && !app.preview.is_interactive());
+        app.handle_event(Event::Resize(120, 30));
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.apply(Action::TogglePreview);
+        assert!(!app.preview_focused && !app.preview.is_interactive());
+        assert!(app.preview.image().is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn focused_preview_scrolls_wrapped_rows_and_renders_focus_indicator() {
         // Width 120 gives a 59-column pane with 57 columns of text.
@@ -3148,6 +3477,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE })
+    }
+
+    /// The frame draws the divider glyph at screen cell (`row`, `col`).
+    fn divider_drawn_at(frame: &str, row: u16, col: u16) -> bool {
+        let cup = format!("\x1b[{};{}H", row + 1, col + 1);
+        frame.match_indices(&cup).any(|(at, _)| {
+            let rest = &frame[at + cup.len()..];
+            // An optional SGR sits between the cursor move and the glyph.
+            let rest = match rest.strip_prefix("\x1b[") {
+                Some(sgr) => sgr.split_once('m').map_or(rest, |(_, after)| after),
+                None => rest,
+            };
+            rest.starts_with('│')
+        })
+    }
+
+    #[test]
+    fn divider_math_keeps_the_half_layout_and_lands_on_every_column() {
+        for w in 100..=400 {
+            // The default share leaves the preview its old w/2 - 1 columns.
+            assert_eq!(w - divider_col(w, 500) - 1, w / 2 - 1, "w = {w}");
+            for col in MIN_SIDE_COLS..w - MIN_SIDE_COLS {
+                assert_eq!(divider_col(w, share_at(w, col)), col, "w = {w}, col = {col}");
+            }
+        }
+        // Both panes keep their minimum at the extremes.
+        assert_eq!(divider_col(120, 1000), MIN_SIDE_COLS);
+        assert_eq!(divider_col(120, 0), 120 - MIN_SIDE_COLS - 1);
+        assert_eq!(clamp_divider(120, 0), MIN_SIDE_COLS);
+        assert_eq!(clamp_divider(120, 119), 120 - MIN_SIDE_COLS - 1);
+    }
+
+    #[test]
+    fn angle_brackets_move_the_divider_and_keep_text_focus_and_scroll() {
+        // 90-column lines: two rows each in the default 57-column text area,
+        // one row each once the preview is widened to its maximum.
+        let text: String = (0..40).map(|i| format!("{i:090}\n")).collect();
+        let (mut app, d) = text_preview_app("divider-keys", &text);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        assert_eq!(app.divider(), Some(60));
+        app.handle_event(special(KeyCode::Right));
+        app.handle_event(special(KeyCode::End));
+        assert_eq!(app.preview_scroll, 80 - app.screen.list_rows());
+
+        // 5% of 120 columns per press; built-in text rewraps without a rerun.
+        app.handle_event(key('<'));
+        assert_eq!(app.divider(), Some(54));
+        assert_eq!(app.pane_width(), 54);
+        assert!(app.preview_focused);
+        assert!(!app.preview.is_busy() && app.preview.lines().is_some());
+        app.handle_event(key('>'));
+        app.handle_event(key('>'));
+        assert_eq!(app.divider(), Some(66));
+        app.render();
+        let frame = out.take();
+        assert!(divider_drawn_at(&frame, 2, 66) && !divider_drawn_at(&frame, 2, 60), "{frame:?}");
+
+        // Each side keeps its minimum; a wider pane pulls the scroll back in.
+        for _ in 0..30 {
+            app.handle_event(key('<'));
+        }
+        assert_eq!(app.divider(), Some(MIN_SIDE_COLS));
+        assert_eq!(app.preview_scroll, 40 - app.screen.list_rows());
+        assert!(app.preview_focused);
+        for _ in 0..30 {
+            app.handle_event(key('>'));
+        }
+        assert_eq!(app.divider(), Some(120 - MIN_SIDE_COLS - 1));
+
+        // Without a pane the keys only say so.
+        app.apply(Action::TogglePreview);
+        let share = app.preview_share;
+        app.handle_event(key('<'));
+        assert_eq!(app.preview_share, share);
+        assert_eq!(app.msg.as_ref().map(|(m, _)| m.as_str()), Some("no preview pane"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dragging_the_divider_resizes_both_panes() {
+        let (mut app, d) = test_app("divider-drag");
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.apply(Action::TogglePreview);
+        let (path, cursor) = (app.dir.path.clone(), app.dir.cursor);
+        assert_eq!(app.dir.hovered_name(), Some("subdir"));
+
+        // A drag that starts elsewhere leaves the divider alone.
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 10, 3));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 80, 3));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 80, 3));
+        assert_eq!(app.divider(), Some(60));
+        // Neither do presses on the context bar or the statusbar.
+        for row in [0, 29] {
+            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 60, row));
+            assert!(!app.dragging, "row {row}");
+        }
+
+        // Grabbed by the divider: the drag moves it and highlights it.
+        app.set_cursor(cursor);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 60, 12));
+        assert!(app.dragging);
+        assert_eq!(app.dir.cursor, cursor, "a divider press is not a row click");
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 12));
+        assert_eq!(app.divider(), Some(40));
+        assert_eq!(app.pane_width(), 40);
+        app.render();
+        let frame = out.take();
+        assert!(divider_drawn_at(&frame, 12, 40), "{frame:?}");
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 12));
+        assert_eq!(app.divider(), Some(MIN_SIDE_COLS));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 2, 12));
+        assert!(!app.dragging);
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 12));
+        assert_eq!(app.divider(), Some(MIN_SIDE_COLS), "released");
+
+        // The column after the divider grabs too, and a quick second press
+        // there is another grab, not a double click opening the hovered dir.
+        for _ in 0..2 {
+            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), MIN_SIDE_COLS + 1, 5));
+            assert!(app.dragging);
+            app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), MIN_SIDE_COLS + 1, 5));
+        }
+        assert_eq!(app.dir.path, path);
+
+        // Dragging works mid-filter and keeps a focused preview focused.
+        act(&mut app, Action::Filter);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), MIN_SIDE_COLS, 5));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 50, 5));
+        assert!(matches!(app.mode, Mode::Filter));
+        assert_eq!(app.divider(), Some(50));
+        act(&mut app, Action::Esc);
+        app.dir.move_to_name("alpha");
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 50, 5));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 5));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 60, 5));
+        assert!(app.preview_focused);
+        assert_eq!(app.divider(), Some(60));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// An app on `pic.png` + `notes.txt`, with a graphics previewer for
     /// `*.png` whose frame's image id is the pane size it was given ("WH").
     #[cfg(unix)]
@@ -3156,9 +3632,12 @@ mod tests {
         std::fs::write(d.join("pic.png"), b"png").unwrap();
         std::fs::write(d.join("notes.txt"), b"text\n").unwrap();
         let previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
             patterns: vec!["*.png".into()],
             cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
             graphics: true,
+            vivid: false,
+            interactive: false,
         }];
         let cfg = Config { previewers, ..Config::default() };
         let out = SharedBuf::default();
@@ -3237,6 +3716,41 @@ mod tests {
         assert!(out.take().contains("\x1b_Ga=T,i=5827"));
         assert_eq!(app.run(), Flow::Quit(0)); // TestSource sends C-q
         assert!(out.take().ends_with("\x1b_Ga=d,d=I,i=5827,q=2\x1b\\"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previewers_rerun_at_the_new_width_once_the_divider_settles() {
+        let (mut app, d, out) = graphics_app("gfxdivider");
+        app.preview_on_hover();
+        drive_preview(&mut app);
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5827)));
+
+        // A key step reruns the previewer at once: 53 columns right of the divider.
+        app.handle_event(key('>'));
+        drive_preview(&mut app);
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5227)));
+        app.dirty = Dirty::Full;
+        app.render();
+        assert!(out.take().contains("\x1b[3;69H\x1b_Ga=T,i=5227"));
+
+        // While dragging, the image is down and the previewer isn't rerun.
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 66, 10));
+        app.render();
+        assert!(out.take().contains("\x1b_Ga=d,d=I,i=5227,q=2\x1b\\"));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 50, 10));
+        app.render();
+        assert!(!out.take().contains("\x1b_Ga=T"), "no image mid-drag");
+        assert!(!app.preview.is_busy());
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(5227)));
+
+        // Released: 69 columns right of the divider, the image back at its new origin.
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 50, 10));
+        drive_preview(&mut app);
+        assert_eq!(app.preview.image().map(|(_, f)| f.id), Some(Some(6827)));
+        app.render();
+        assert!(out.take().contains("\x1b[3;53H\x1b_Ga=T,i=6827"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -3510,24 +4024,242 @@ mod tests {
 
         // A user rule wins, file name appended after its command.
         let path = hover(&mut app, "doc.pdf");
-        assert_eq!(app.file_open(&path, "doc.pdf", false), FileOpen::Program("kitpdf -z 2 doc.pdf".into()));
+        assert_eq!(app.file_open(&path, "doc.pdf", &|_| false), FileOpen::Program("kitpdf -z 2 doc.pdf".into()));
 
         // Built-in kitim: needs graphics and kitim installed, else unknown.
         app.graphics = true;
         let path = hover(&mut app, "pic.png");
-        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Program("kitim --fullscreen pic.png".into()));
+        assert_eq!(app.file_open(&path, "pic.png", &|_| true), FileOpen::Program("kitim --fullscreen pic.png".into()));
         let path = hover(&mut app, "song.flac");
-        assert_eq!(app.file_open(&path, "song.flac", false), FileOpen::Nothing);
+        assert_eq!(app.file_open(&path, "song.flac", &|_| false), FileOpen::Nothing);
         app.graphics = false;
         let path = hover(&mut app, "pic.png");
-        assert_eq!(app.file_open(&path, "pic.png", true), FileOpen::Nothing);
+        assert_eq!(app.file_open(&path, "pic.png", &|_| true), FileOpen::Nothing);
         app.graphics = true;
 
         // Text opens in the editor; an unknown binary does nothing.
         let path = hover(&mut app, "t.txt");
-        assert_eq!(app.file_open(&path, "t.txt", false), FileOpen::Edit);
+        assert_eq!(app.file_open(&path, "t.txt", &|_| false), FileOpen::Edit);
         let path = hover(&mut app, "blob.dat");
-        assert_eq!(app.file_open(&path, "blob.dat", true), FileOpen::Nothing);
+        assert_eq!(app.file_open(&path, "blob.dat", &|_| true), FileOpen::Nothing);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Polls `file` until its lines satisfy `done`, or panics after 5 s.
+    #[cfg(unix)]
+    fn wait_lines(file: &Path, done: impl Fn(&[String]) -> bool) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            if done(&lines) {
+                return lines;
+            }
+            assert!(Instant::now() < deadline, "{}: {lines:?}", file.display());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn terminal_preview_profiles_override_shared_rules_and_keep_custom_order() {
+        let d = tmpdir("preview-profiles");
+        let file = d.join("config.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[previewer]]
+match = ["*.png", "*.md", "*.txt"]
+run = "shared-text"
+
+[preview.kitty]
+kitim = true
+kitpdf = true
+[[preview.kitty.previewer]]
+match = ["*.png"]
+run = "custom-kitim --preview"
+graphics = true
+[[preview.kitty.previewer]]
+match = ["*.png"]
+run = "later-kitim"
+graphics = true
+
+[preview.vivido]
+vivi = true
+vvrd = true
+[[preview.vivido.previewer]]
+match = ["*.png"]
+run = "custom-vivi --preview"
+vivid = true
+[[preview.vivido.previewer]]
+match = ["*.txt"]
+run = "vivido-text"
+[[preview.vivido.previewer]]
+match = ["*.gif"]
+run = "vivido-kitty-protocol"
+graphics = true
+"#,
+        )
+        .unwrap();
+        let (cfg, err) = Config::load(Some(&file));
+        assert!(err.is_none(), "{err:?}");
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        fn command<'a>(app: &'a App, name: &str) -> Option<&'a str> {
+            app.match_previewer(name)
+                .map(|i| app.cfg.previewers[i].cmd.as_str())
+        }
+        app.set_term(term::Kind::Vivid, None);
+        assert_eq!(command(&app, "pic.png"), Some("custom-vivi --preview"));
+        assert_eq!(command(&app, "doc.pdf"), Some("vvrd --preview"));
+        assert_eq!(command(&app, "README.md"), Some("vvrd --preview"));
+        assert_eq!(command(&app, "notes.txt"), Some("vivido-text"));
+        assert_eq!(command(&app, "clip.gif"), Some("vivi --preview"));
+        app.graphics = true;
+        assert_eq!(command(&app, "clip.gif"), Some("vivido-kitty-protocol"));
+        assert_eq!(command(&app, "pic.png"), Some("custom-vivi --preview"));
+
+        app.set_term(term::Kind::KittyGraphics, None);
+        assert_eq!(command(&app, "pic.png"), Some("custom-kitim --preview"));
+        assert_eq!(command(&app, "clip.gif"), Some("kitim --preview"));
+        assert_eq!(command(&app, "doc.pdf"), Some("kitpdf --preview"));
+        assert_eq!(command(&app, "README.md"), Some("shared-text"));
+        assert_eq!(command(&app, "notes.txt"), Some("shared-text"));
+
+        app.graphics = false;
+        app.set_term(term::Kind::Other, None);
+        assert_eq!(command(&app, "pic.png"), Some("shared-text"));
+        assert_eq!(command(&app, "doc.pdf"), None);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn vivido_inherits_kitty_previews_only_when_its_section_is_absent() {
+        let d = tmpdir("preview-inheritance");
+        let file = d.join("config.toml");
+        for kitty in ["[preview]", "[preview.kitty]"] {
+            for (vivido, image, document) in [
+                ("", Some("kitim --preview"), Some("kitpdf --preview")),
+                ("[preview.vivido]", None, None),
+                ("[preview.vivido]\nvivi=true", Some("vivi --preview"), None),
+            ] {
+                std::fs::write(
+                    &file,
+                    format!("{kitty}\nkitim=true\nkitpdf=true\n{vivido}\n"),
+                )
+                .unwrap();
+                let (cfg, err) = Config::load(Some(&file));
+                assert!(err.is_none(), "{err:?}");
+                let screen = Screen::new(Box::new(io::sink()), 120, 30);
+                let mut app =
+                    App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+                app.sel.file = d.join(".sel");
+                app.set_term(term::Kind::Vivid, None);
+                assert_eq!(
+                    app.match_previewer("doc.pdf")
+                        .map(|i| app.cfg.previewers[i].cmd.as_str()),
+                    None,
+                    "Kitty previews must wait for the graphics probe"
+                );
+                app.graphics = true;
+                for (name, expected) in [("pic.png", image), ("doc.pdf", document)] {
+                    assert_eq!(
+                        app.match_previewer(name)
+                            .map(|i| app.cfg.previewers[i].cmd.as_str()),
+                        expected,
+                        "{kitty}, {vivido}, {name}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vivid_previews_run_only_in_vivid_get_the_pane_origin_and_hide_under_overlays() {
+        let (mut app, d, out) = graphics_app("vivid");
+        // Records its arguments, then every stdin line, in the directory it runs in.
+        let script = r#"printf '%s\n' "$@" > args.log; while read -r l; do echo "$l" >> cmds.log; done"#;
+        app.cfg.previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
+            patterns: vec!["*.png".into()],
+            cmd: format!("sh -c '{}' sh", script.replace('\'', r#"'\''"#)),
+            graphics: false,
+            vivid: true,
+            interactive: true,
+        }];
+        app.set_term(term::Kind::Other, None);
+        drive_preview(&mut app);
+        assert!(!app.preview.is_vivid(), "a Vivid rule ran outside Vivid");
+
+        app.set_term(term::Kind::Vivid, None);
+        assert!(app.preview.is_vivid() && app.preview.is_interactive());
+        app.preview.tick(Instant::now());
+        // 120x30: a 59-col pane, its body 58 cols x 27 rows from column 62, row 2.
+        let args = wait_lines(&d.join("args.log"), |l| l.len() == 5);
+        assert_eq!(args[1..], ["58", "27", "62", "2"]);
+        assert!(args[0].ends_with("pic.png"), "{args:?}");
+        app.dirty = Dirty::Full;
+        app.render();
+        // The directory title may truncate with an ellipsis; check the preview header.
+        assert!(!out.take().contains("pic.png …"), "a running Vivid preview is not loading");
+
+        // Page turns while focused; hidden while help covers the pane.
+        app.handle_event(special(KeyCode::Right));
+        assert!(app.preview_focused);
+        app.handle_event(key('j'));
+        app.handle_event(special(KeyCode::Esc));
+        act(&mut app, Action::Help);
+        app.render();
+        act(&mut app, Action::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        app.render();
+        let cmds = wait_lines(&d.join("cmds.log"), |l| l.len() == 3);
+        assert_eq!(cmds, ["next", "hide", "show"]);
+
+        // A previewer that exits by itself shows its stderr's first line.
+        app.cfg.previewers[0].cmd = "sh -c 'echo; echo \"vivi: no picture\" >&2; exit 1' sh".into();
+        app.preview_supersede();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.preview.error().is_none() && Instant::now() < deadline {
+            app.preview.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.preview.error(), Some("vivi: no picture"));
+        app.preview.stop();
+        assert!(!app.preview.is_busy());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_in_vivid_opens_documents_in_vvrd_and_media_in_vivi() {
+        let d = tmpdir("openvivid");
+        std::fs::write(d.join("doc.pdf"), b"%PDF-1.4 noise").unwrap();
+        std::fs::write(d.join("README.md"), b"# hi\n").unwrap();
+        std::fs::write(d.join("pic.png"), [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(Config::default(), d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        app.term = term::Kind::Vivid;
+        app.graphics = true;
+        let open = |app: &App, name: &str, installed: &dyn Fn(&str) -> bool| {
+            app.file_open(&d.join(name), name, installed)
+        };
+        let all = |_: &str| true;
+        assert_eq!(open(&app, "doc.pdf", &all), FileOpen::Program("vvrd doc.pdf".into()));
+        assert_eq!(open(&app, "README.md", &all), FileOpen::Program("vvrd README.md".into()));
+        assert_eq!(open(&app, "pic.png", &all), FileOpen::Program("vivi --fullscreen pic.png".into()));
+        // Without the Vivid viewers, kitty graphics and the editor take over again.
+        let kitim = |p: &str| p == "kitim";
+        assert_eq!(open(&app, "pic.png", &kitim), FileOpen::Program("kitim --fullscreen pic.png".into()));
+        assert_eq!(open(&app, "README.md", &kitim), FileOpen::Edit);
+        // Outside Vivid the Vivid viewers are never used.
+        app.term = term::Kind::KittyGraphics;
+        // This fixture's head reads as text.
+        assert_eq!(open(&app, "doc.pdf", &all), FileOpen::Edit);
+        assert_eq!(open(&app, "pic.png", &all), FileOpen::Program("kitim --fullscreen pic.png".into()));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -3550,9 +4282,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ui.preview = true;
         cfg.previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
             graphics: false,
+            vivid: false,
+            interactive: false,
         }];
         let src = TestSource::new();
         let screen = Screen::new(Box::new(Vec::new()), 120, 30);

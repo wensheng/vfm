@@ -132,7 +132,8 @@ fn main() -> ExitCode {
     }
     // Probe once startup can no longer fail (late replies would land in the
     // shell) and before run() paints the first frame over any query echo.
-    (app.term, app.probe) = term::detect();
+    let (kind, probe) = term::detect();
+    app.set_term(kind, probe);
 
     let flow = app.run();
 

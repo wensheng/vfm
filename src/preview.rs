@@ -12,18 +12,35 @@
 //! of lines. Only the latest frame is kept, for the App to forward to the
 //! terminal; their channel holds one frame, so a slow UI stalls the
 //! previewer instead of queueing megabytes of stale frames.
+//!
+//! Vivid previewers draw through the Vivid side channel themselves, so vfm
+//! reads nothing from their stdout. They run until vfm closes their stdin,
+//! which also carries page turns and `hide`/`show` while the pane is covered;
+//! their stderr is kept as the message if they exit on their own.
 
 use crate::ansi::AnsiFeeder;
 use crate::graphics::{Frame, Splitter};
 use crate::sort::natural_cmp;
 use crate::ui::Line;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
+/// Bound retained text and highlighting work while allowing focused scrolling.
 const MAX_LINES: usize = 20_000;
+
+/// How long a superseded Vivid previewer gets to tear down after its stdin
+/// closes, before it is killed.
+///
+/// Clean teardown removes its picture at once and lets vvrd stop its render
+/// workers; a kill also removes the picture, when the presenter sees the
+/// connection drop. Reaping is off-thread, so this never delays input.
+const VIVID_GRACE: Duration = Duration::from_millis(300);
+
+/// Most stderr kept from a Vivid previewer: room for an error line.
+const MAX_MESSAGE: usize = 512;
 const READ_BUF: usize = 64 * 1024;
 
 /// Bytes of a file's head checked to tell text from binary.
@@ -33,22 +50,25 @@ const SNIFF_BYTES: usize = 8192;
 /// Ubuntu install bat as `batcat`.
 const BAT_NAMES: [&str; 2] = ["bat", "batcat"];
 
-/// bat flags for a pane: colors through the pipe, no decorations, no pager,
-/// and no wrapping, since the pane wraps lines itself.
-const BAT_FLAGS: [&str; 4] = ["--color=always", "--style=plain", "--paging=never", "--wrap=never"];
+/// Keep colors and requested decorations through the pipe, with no pager
+/// or wrapping, since the pane wraps lines itself.
+const BAT_FLAGS: [&str; 4] = ["--color=always", "--decorations=always", "--paging=never", "--wrap=never"];
 
 /// The highlighter argv for text previews: bat, if `enabled` and
-/// `installed` finds it under one of its names.
-pub fn bat_argv(enabled: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+/// `installed` finds it under one of its names. `line_numbers` selects
+/// numbered (`-n`) or plain (`-p`) output.
+pub fn bat_argv(enabled: bool, line_numbers: bool, installed: impl Fn(&str) -> bool) -> Option<Vec<String>> {
     let prog = BAT_NAMES.into_iter().filter(|_| enabled).find(|name| installed(name))?;
-    Some(std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect())
+    let style = if line_numbers { "-n" } else { "-p" };
+    Some(std::iter::once(prog).chain(BAT_FLAGS).chain([style]).map(String::from).collect())
 }
 
 // ---------------------------------------------------------------- signature
 
-/// FNV-1a over path bytes, size, mtime, pane size and rule id — identical
+/// FNV-1a over path bytes, size, mtime, layout and rule id — identical
 /// signature means "already showing this content" (yazi PreviewSig).
-pub fn make_sig(path: &Path, size: u64, mtime: i64, pane: (u16, u16), rule: usize) -> u64 {
+/// `layout` lists the screen and pane sizes the output depends on.
+pub fn make_sig(path: &Path, size: u64, mtime: i64, layout: &[u16], rule: usize) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: &[u8]| {
         for &byte in b {
@@ -59,8 +79,9 @@ pub fn make_sig(path: &Path, size: u64, mtime: i64, pane: (u16, u16), rule: usiz
     mix(path.as_os_str().as_encoded_bytes());
     mix(&size.to_le_bytes());
     mix(&mtime.to_le_bytes());
-    mix(&pane.0.to_le_bytes());
-    mix(&pane.1.to_le_bytes());
+    for n in layout {
+        mix(&n.to_le_bytes());
+    }
     mix(&rule.to_le_bytes());
     h
 }
@@ -81,6 +102,9 @@ pub enum PreviewMsg {
 pub struct JobHandle {
     child: Option<Child>,
     pub rx: Receiver<PreviewMsg>,
+    input: Option<SyncSender<&'static str>>,
+    /// Close stdin and wait [`VIVID_GRACE`] before killing on drop.
+    graceful: bool,
 }
 
 impl JobHandle {
@@ -93,30 +117,91 @@ impl JobHandle {
         std::thread::Builder::new()
             .name("vfm-preview".into())
             .spawn(move || read_job(stdout, tx, max_bytes))?;
-        Ok(JobHandle { child: Some(child), rx })
+        Ok(JobHandle { child: Some(child), rx, input: None, graceful: false })
     }
 
     /// Run a graphics previewer: stdout is cut into frames (see `graphics`).
-    pub fn spawn_graphics(mut command: Command) -> std::io::Result<JobHandle> {
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    pub fn spawn_graphics(mut command: Command, interactive: bool) -> std::io::Result<JobHandle> {
+        command
+            .stdin(if interactive { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = mpsc::sync_channel(1);
+        // Own the child before spawning threads so errors also kill and reap it.
+        let stdin = child.stdin.take();
+        let mut job = JobHandle { child: Some(child), rx, input: None, graceful: false };
+        if let Some(stdin) = stdin {
+            job.input = Some(spawn_input(stdin)?);
+        }
         std::thread::Builder::new()
             .name("vfm-preview".into())
             .spawn(move || read_graphics(stdout, tx))?;
-        Ok(JobHandle { child: Some(child), rx })
+        Ok(job)
     }
+
+    /// Kills and reaps the child now; dropping the handle then does nothing.
+    pub fn terminate(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Run a Vivid previewer: it draws by itself, takes commands on stdin,
+    /// and its stderr is the message if it exits before vfm stops it.
+    pub fn spawn_vivid(mut command: Command) -> std::io::Result<JobHandle> {
+        command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut job = JobHandle { child: Some(child), rx, input: None, graceful: true };
+        job.input = Some(spawn_input(stdin)?);
+        std::thread::Builder::new()
+            .name("vfm-preview".into())
+            .spawn(move || read_vivid(stderr, tx))?;
+        Ok(job)
+    }
+}
+
+/// Starts the thread that writes queued commands to a previewer's stdin.
+/// Dropping the returned sender ends the thread, which closes the pipe.
+fn spawn_input(mut stdin: std::process::ChildStdin) -> std::io::Result<SyncSender<&'static str>> {
+    // Bound key repeat while a document is slow; never block the UI on a pipe.
+    let (input, commands) = mpsc::sync_channel::<&'static str>(16);
+    std::thread::Builder::new().name("vfm-preview-input".into()).spawn(move || {
+        while let Ok(command) = commands.recv() {
+            if stdin.write_all(command.as_bytes()).is_err() {
+                break;
+            }
+        }
+    })?;
+    Ok(input)
 }
 
 impl Drop for JobHandle {
     fn drop(&mut self) {
+        // Closes stdin once the input thread has written what it holds.
+        drop(self.input.take());
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            let graceful = self.graceful;
+            if !graceful {
+                let _ = child.kill();
+            }
             // Reap off-thread: the reader may still be draining the pipe.
             std::thread::Builder::new()
                 .name("vfm-reap".into())
                 .spawn(move || {
+                    let deadline = Instant::now() + VIVID_GRACE;
+                    while graceful && Instant::now() < deadline {
+                        if !matches!(child.try_wait(), Ok(None)) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let _ = child.kill();
                     let _ = child.wait();
                 })
                 .ok();
@@ -187,6 +272,36 @@ fn read_graphics(mut stdout: impl Read, tx: SyncSender<PreviewMsg>) {
     });
 }
 
+/// Vivid reader-thread body: keeps the head of stderr until it closes,
+/// which is when the previewer exits, then reports its first line.
+fn read_vivid(mut stderr: impl Read, tx: SyncSender<PreviewMsg>) {
+    let mut text = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = MAX_MESSAGE.saturating_sub(text.len());
+                text.extend_from_slice(&buf[..n.min(room)]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let _ = tx.send(PreviewMsg::Failed(vivid_message(&text)));
+}
+
+/// The first nonblank line of a Vivid previewer's stderr, control
+/// characters removed, as the pane's error.
+fn vivid_message(text: &[u8]) -> String {
+    let text = String::from_utf8_lossy(text);
+    text.lines()
+        .map(|line| line.chars().filter(|c| !c.is_control()).collect::<String>())
+        .map(|line| line.trim().to_string())
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| "previewer exited".into())
+}
+
 // ---------------------------------------------------------------- state
 
 /// What produces a preview's content.
@@ -198,6 +313,12 @@ pub enum Source {
     Previewer(Vec<String>),
     /// A `graphics = true` previewer: same argv, but its output is frames.
     Graphics(Vec<String>),
+    /// Graphics with a persistent stdin command pipe for page navigation.
+    InteractiveGraphics(Vec<String>),
+    /// A `vivid = true` previewer: the argv also gets the pane's top-left
+    /// grid cell (`origin`, column then row), and it draws by itself.
+    /// `interactive` ones turn pages like interactive graphics.
+    Vivid { argv: Vec<String>, origin: (u16, u16), interactive: bool },
     /// A `>` plugin's command line, run through the shell in the current
     /// directory. Never cached: it describes the directory, which changes.
     Shell(String),
@@ -248,6 +369,8 @@ pub struct Preview {
     /// Runs text files that no `[[previewer]]` rule matches (see [`bat_argv`]);
     /// `None` keeps the built-in plain-text head.
     pub highlight: Option<Vec<String>>,
+    /// Something covers the pane: a Vivid previewer is told to hide.
+    covered: bool,
     /// Snapshot taken at request() time; used when the debounce expires.
     pane: (u16, u16),
     env: Vec<(String, String)>,
@@ -268,6 +391,7 @@ impl Preview {
             debounce,
             max_bytes,
             highlight: None,
+            covered: false,
             pane: (80, 24),
             env: Vec::new(),
             cwd: PathBuf::from("."),
@@ -284,6 +408,50 @@ impl Preview {
 
     pub fn is_busy(&self) -> bool {
         matches!(self.state, PreviewState::Running { .. } | PreviewState::Debounce { .. })
+    }
+
+    /// Whether the current preview can receive page commands.
+    pub fn is_interactive(&self) -> bool {
+        matches!(&self.state, PreviewState::Debounce { target, .. } | PreviewState::Running { target, .. }
+            if matches!(target.source, Source::InteractiveGraphics(_) | Source::Vivid { interactive: true, .. }))
+    }
+
+    /// Whether a Vivid previewer is starting or showing: the pane has no
+    /// text, and the picture is up without vfm drawing it.
+    pub fn is_vivid(&self) -> bool {
+        matches!(&self.state, PreviewState::Debounce { target, .. } | PreviewState::Running { target, .. }
+            if matches!(target.source, Source::Vivid { .. }))
+    }
+
+    /// Tells a Vivid previewer to hide while something covers the pane, and
+    /// to show again after. Remembered for previewers started meanwhile.
+    pub fn set_covered(&mut self, covered: bool) {
+        if covered == self.covered {
+            return;
+        }
+        self.covered = covered;
+        self.send_visibility();
+    }
+
+    fn send_visibility(&self) {
+        if let PreviewState::Running { target: Target { source: Source::Vivid { .. }, .. }, job } = &self.state {
+            if let Some(input) = &job.input {
+                let _ = input.try_send(if self.covered { "hide\n" } else { "show\n" });
+            }
+        }
+    }
+
+    /// Queue a page command without blocking input while the previewer renders.
+    pub fn turn_page(&mut self, command: &'static str) {
+        // A keypress during debounce should start the child before sending input.
+        if let PreviewState::Debounce { at, .. } = &self.state {
+            self.tick(*at);
+        }
+        if let PreviewState::Running { job, .. } = &self.state {
+            if let Some(input) = &job.input {
+                let _ = input.try_send(command);
+            }
+        }
     }
 
     /// Failed-state error text, if any.
@@ -324,6 +492,15 @@ impl Preview {
         }
         let at = now + self.debounce;
         self.state = PreviewState::Debounce { target, at };
+    }
+
+    /// Like [`Self::disable`], but a running previewer is killed and reaped
+    /// before this returns, so it can't draw or play over what comes next.
+    pub fn stop(&mut self) {
+        if let PreviewState::Running { job, .. } = &mut self.state {
+            job.terminate();
+        }
+        self.disable();
     }
 
     pub fn disable(&mut self) {
@@ -435,7 +612,9 @@ impl Preview {
 
     /// Transition Debounce → Running (external command) or Done (builtin).
     fn start(&mut self, target: Target) -> Tick {
-        let graphics = matches!(target.source, Source::Graphics(_));
+        let graphics = matches!(target.source, Source::Graphics(_) | Source::InteractiveGraphics(_));
+        let vivid = matches!(target.source, Source::Vivid { .. });
+        let interactive = matches!(target.source, Source::InteractiveGraphics(_));
         let command = match &target.source {
             Source::Builtin => match self.highlighter(&target.path) {
                 Some(command) => command,
@@ -448,7 +627,10 @@ impl Preview {
                     return Tick::Finished;
                 }
             },
-            Source::Previewer(argv) | Source::Graphics(argv) => {
+            Source::Previewer(argv)
+            | Source::Graphics(argv)
+            | Source::InteractiveGraphics(argv)
+            | Source::Vivid { argv, .. } => {
                 let Some((prog, args)) = argv.split_first() else {
                     self.state = PreviewState::Failed { sig: target.sig, err: "empty command".into() };
                     return Tick::Failed;
@@ -460,15 +642,28 @@ impl Preview {
                     .arg(self.pane.1.to_string())
                     .envs(self.env.iter().map(|(k, v)| (k, v)))
                     .current_dir(&self.cwd);
+                if let Source::Vivid { origin, .. } = &target.source {
+                    c.arg(origin.0.to_string()).arg(origin.1.to_string());
+                }
                 c
             }
             Source::Shell(line) => crate::plugin::shell_command(line, &self.cwd, &self.env),
         };
         let program = command.get_program().to_string_lossy().into_owned();
-        let job = if graphics { JobHandle::spawn_graphics(command) } else { JobHandle::spawn(command, self.max_bytes) };
+        let job = if vivid {
+            JobHandle::spawn_vivid(command)
+        } else if graphics {
+            JobHandle::spawn_graphics(command, interactive)
+        } else {
+            JobHandle::spawn(command, self.max_bytes)
+        };
         match job {
             Ok(job) => {
                 self.state = PreviewState::Running { target, job };
+                // A previewer starts visible; one started under a cover hides at once.
+                if self.covered {
+                    self.send_visibility();
+                }
                 Tick::Quiet
             }
             Err(e) => {
@@ -483,8 +678,8 @@ impl Preview {
 impl Preview {
     /// The highlighter command for `path` if it is a readable text file.
     /// Binary files stay built-in: bat passes them through when piped.
-    /// Only lines that can show are asked for, since highlighting a large
-    /// file whole takes seconds.
+    /// Load beyond the initial pane for focused scrolling, but bound the
+    /// highlighting work. One extra line lets the reader detect truncation.
     fn highlighter(&self, path: &Path) -> Option<Command> {
         let (prog, flags) = self.highlight.as_ref()?.split_first()?;
         if !is_text_file(path) {
@@ -492,7 +687,7 @@ impl Preview {
         }
         let mut c = Command::new(prog);
         c.args(flags)
-            .arg(format!("--line-range=:{}", self.pane.1.max(1)))
+            .arg(format!("--line-range=:{}", MAX_LINES + 1))
             .arg("--")
             .arg(path)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
@@ -636,6 +831,27 @@ fn sniff_kind(data: &[u8]) -> &'static str {
 mod tests {
     use super::*;
 
+    // Child process fixture: exercises real pipes on Windows as well as Unix.
+    #[test]
+    #[ignore = "spawned by the interactive preview integration test"]
+    fn interactive_child() {
+        use std::io::BufRead;
+        let mut out = std::io::stdout().lock();
+        write!(out, "\x1b_Ga=T,i=1;AAAA\x1b\\").unwrap();
+        out.flush().unwrap();
+        for command in std::io::stdin().lock().lines() {
+            let id = match command.unwrap().as_str() {
+                "next" => 2,
+                "prev" => 3,
+                "first" => 4,
+                "last" => 5,
+                _ => 6,
+            };
+            write!(out, "\x1b_Ga=T,i={id};AAAA\x1b\\").unwrap();
+            out.flush().unwrap();
+        }
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("vfm-prev-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -710,13 +926,14 @@ mod tests {
     #[test]
     fn sig_changes_with_inputs() {
         let p = Path::new("/tmp/x");
-        let base = make_sig(p, 10, 20, (80, 24), 0);
-        assert_eq!(base, make_sig(p, 10, 20, (80, 24), 0));
-        assert_ne!(base, make_sig(p, 11, 20, (80, 24), 0));
-        assert_ne!(base, make_sig(p, 10, 21, (80, 24), 0));
-        assert_ne!(base, make_sig(p, 10, 20, (79, 24), 0));
-        assert_ne!(base, make_sig(p, 10, 20, (80, 24), 1));
-        assert_ne!(base, make_sig(Path::new("/tmp/y"), 10, 20, (80, 24), 0));
+        let base = make_sig(p, 10, 20, &[80, 24], 0);
+        assert_eq!(base, make_sig(p, 10, 20, &[80, 24], 0));
+        assert_ne!(base, make_sig(p, 11, 20, &[80, 24], 0));
+        assert_ne!(base, make_sig(p, 10, 21, &[80, 24], 0));
+        assert_ne!(base, make_sig(p, 10, 20, &[79, 24], 0));
+        assert_ne!(base, make_sig(p, 10, 20, &[80, 24, 39], 0));
+        assert_ne!(base, make_sig(p, 10, 20, &[80, 24], 1));
+        assert_ne!(base, make_sig(Path::new("/tmp/y"), 10, 20, &[80, 24], 0));
     }
 
     #[cfg(unix)]
@@ -824,19 +1041,43 @@ mod tests {
             pv.lines().unwrap().0.iter().map(|l| l.text()).collect::<Vec<_>>()
         };
         let path = d.join("t.rs").display().to_string();
-        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:24 -- {path}")]);
+        assert_eq!(show("t.rs", 1), [format!("HL --line-range=:{} -- {path}", MAX_LINES + 1)]);
         assert_eq!(show("bin.dat", 2)[0], "binary: PNG image");
         assert!(show("sub", 3).is_empty(), "empty dir listing");
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn highlighted_preview_marks_the_line_limit_as_truncated() {
+        let d = tmpdir("highlight-limit");
+        let path = d.join("large.txt");
+        std::fs::write(&path, "x\n".repeat(MAX_LINES + 2)).unwrap();
+        let mut pv = Preview::new(Duration::ZERO, 256 * 1024);
+        pv.set_context((40, 24), Vec::new(), &d);
+        let script = r#"head -n "${1##*:}" "$3""#;
+        pv.highlight = Some(vec!["sh".into(), "-c".into(), script.into(), "sh".into()]);
+        pv.request(Target { path, source: Source::Builtin, sig: 1 }, Instant::now());
+        run_to_done(&mut pv);
+        let (lines, truncated) = pv.lines().unwrap();
+        assert_eq!(lines.len(), MAX_LINES);
+        assert!(truncated);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn bat_is_found_under_either_name_unless_disabled() {
-        let flags = |prog: &str| std::iter::once(prog).chain(BAT_FLAGS).map(String::from).collect::<Vec<_>>();
-        assert_eq!(bat_argv(true, |p| p == "bat"), Some(flags("bat")));
-        assert_eq!(bat_argv(true, |p| p == "batcat"), Some(flags("batcat")));
-        assert_eq!(bat_argv(true, |_| false), None);
-        assert_eq!(bat_argv(false, |_| true), None);
+        for (line_numbers, style) in [(true, "-n"), (false, "-p")] {
+            let flags = |prog: &str| {
+                [prog, "--color=always", "--decorations=always", "--paging=never", "--wrap=never", style]
+                    .map(String::from)
+                    .to_vec()
+            };
+            assert_eq!(bat_argv(true, line_numbers, |p| p == "bat"), Some(flags("bat")));
+            assert_eq!(bat_argv(true, line_numbers, |p| p == "batcat"), Some(flags("batcat")));
+            assert_eq!(bat_argv(true, line_numbers, |_| false), None);
+            assert_eq!(bat_argv(false, line_numbers, |_| true), None);
+        }
     }
 
     #[test]
@@ -855,8 +1096,7 @@ mod tests {
         let d = tmpdir("state");
         let path = d.join("f.txt");
         std::fs::write(&path, b"hello\n").unwrap();
-        let pane = (80u16, 24u16);
-        let sig = make_sig(&path, 6, 1, pane, 0);
+        let sig = make_sig(&path, 6, 1, &[80, 24], 0);
 
         let t0 = Instant::now();
         pv.request(Target { path: path.clone(), source: Source::Builtin, sig }, t0);

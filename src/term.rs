@@ -1,7 +1,7 @@
 //! Host terminal detection: sorts the terminal vfm runs in into a [`Kind`],
 //! and finds out whether it can show kitty graphics.
 //!
-//! Vivid advertises itself through two environment variables, so it is known
+//! Vivido and Vivida advertise their name or Vivid endpoint, so they are known
 //! at once; whether it can show graphics is still probed, like any other
 //! terminal. Kitty graphics support is probed rather than guessed from the
 //! terminal's name, because kitty, Ghostty, Konsole and others all implement
@@ -20,15 +20,20 @@
 //! lost. The thread reads its own nonblocking descriptor, so it always quits
 //! by [`DEADLINE`] instead of lingering in `read()` to steal later input.
 //!
-//! Probing needs a Unix tty. Elsewhere, every terminal but Vivid is `Other`,
-//! and none shows graphics.
+//! Unix probes read the tty directly. Windows probes temporarily enable VT
+//! input and collect console key records before crossterm handles normal input.
 
 // Rust guideline compliant 2026-10-07
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+#[cfg(any(not(windows), test))]
+use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyCode, KeyEvent};
 use std::ffi::OsStr;
+#[cfg(not(windows))]
 use std::fs::File;
-use std::io::{self, Read, Write};
+#[cfg(any(not(windows), test))]
+use std::io::Read;
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -55,12 +60,13 @@ const DEADLINE: Duration = Duration::from_secs(1);
 ///
 /// Local terminals reply within a millisecond, so 2 ms adds little latency
 /// while bounding the loop to about 500 wakeups before [`DEADLINE`].
+#[cfg(any(not(windows), test))]
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Terminal category vfm is running inside.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// The Vivid terminal, whether or not it shows graphics.
+    /// Vivido or Vivida, whether or not it shows Kitty graphics.
     Vivid,
     /// Any other terminal that answers the kitty graphics protocol query.
     KittyGraphics,
@@ -124,10 +130,29 @@ impl Probe {
 ///
 /// If the probe thread can't be spawned.
 pub fn detect() -> (Kind, Option<Probe>) {
+    let program = std::env::var_os("TERM_PROGRAM");
     let control = std::env::var_os("VIVID_ENDPOINT_CONTROL");
     let secret = std::env::var_os("VIVID_ROOT_SECRET");
-    let kind = if vivid_advertised(control.as_deref(), secret.as_deref()) { Kind::Vivid } else { Kind::Other };
+    let kind = environment_kind(program.as_deref(), control.as_deref(), secret.as_deref());
     (kind, spawn_probe())
+}
+
+/// Recognizes Vivido and Vivida by name or their advertised Vivid endpoint.
+fn environment_kind(
+    program: Option<&OsStr>,
+    control: Option<&OsStr>,
+    secret: Option<&OsStr>,
+) -> Kind {
+    let named = program.and_then(OsStr::to_str).is_some_and(|p| {
+        ["vivido", "vivida", "vivid"]
+            .iter()
+            .any(|name| p.eq_ignore_ascii_case(name))
+    });
+    if named || vivid_advertised(control, secret) {
+        Kind::Vivid
+    } else {
+        Kind::Other
+    }
 }
 
 /// Whether Vivid's endpoint is advertised: both variables set and non-empty.
@@ -138,6 +163,7 @@ fn vivid_advertised(control: Option<&OsStr>, secret: Option<&OsStr>) -> bool {
 }
 
 /// Writes [`QUERY`] and starts the thread that collects the replies.
+#[cfg(not(windows))]
 fn spawn_probe() -> Option<Probe> {
     let (mut reader, mut writer) = open_tty()?;
     writer.write_all(QUERY).ok()?;
@@ -169,12 +195,110 @@ fn open_tty() -> Option<(File, File)> {
 }
 
 /// No tty to probe outside Unix.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_tty() -> Option<(File, File)> {
     None
 }
 
+/// Restores native keyboard input after Windows has delivered the probe replies.
+#[cfg(windows)]
+struct ConsoleMode {
+    mode: crossterm_winapi::ConsoleMode,
+    original: u32,
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleMode {
+    fn drop(&mut self) {
+        let _ = self.mode.set_mode(self.original);
+    }
+}
+
+#[cfg(windows)]
+fn spawn_probe() -> Option<Probe> {
+    use crossterm_winapi::Handle;
+    let mode = crossterm_winapi::ConsoleMode::from(Handle::current_in_handle().ok()?);
+    let original = mode.mode().ok()?;
+    // ENABLE_VIRTUAL_TERMINAL_INPUT preserves APC/CSI replies through ConPTY.
+    mode.set_mode(original | 0x0200).ok()?;
+    let guard = ConsoleMode { mode, original };
+    let mut out = io::stdout().lock();
+    out.write_all(QUERY).ok()?;
+    out.flush().ok()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("vfm-term".into())
+        .spawn(move || {
+            let mut scan = ConsoleScan::default();
+            let deadline = Instant::now() + DEADLINE;
+            while !scan.da1 && Instant::now() < deadline {
+                match crossterm::event::poll(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(true) => match crossterm::event::read() {
+                        Ok(crossterm::event::Event::Key(key)) => scan.feed(key),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
+                    _ => break,
+                }
+            }
+            scan.keys.append(&mut scan.pending);
+            drop(guard); // Restore native input before the app resumes polling it.
+            let _ = tx.send(Report { graphics: scan.graphics, typeahead: scan.keys });
+        })
+        .ok()?;
+    Some(Probe { rx })
+}
+
+/// Windows can omit the ESC records around APC/CSI replies; retain original
+/// key events until a complete reply is recognized so typeahead keeps modifiers.
+#[cfg(windows)]
+#[derive(Default)]
+struct ConsoleScan {
+    pending: Vec<KeyEvent>,
+    keys: Vec<KeyEvent>,
+    graphics: bool,
+    da1: bool,
+}
+
+#[cfg(windows)]
+impl ConsoleScan {
+    fn feed(&mut self, key: KeyEvent) {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return;
+        }
+        self.pending.push(key);
+        let text: String = self.pending.iter().filter_map(|key| key.code.as_char()).collect();
+        // Replies are short control strings; this also bounds ambiguous typeahead.
+        if self.pending.len() > 512 {
+            self.keys.append(&mut self.pending);
+            return;
+        }
+        if text.starts_with("_G") && text.ends_with('\\') {
+            self.graphics |= answers_query(&text.as_bytes()[2..text.len() - 1]);
+            self.pending.clear();
+            return;
+        }
+        if text.starts_with("[?")
+            && text.ends_with('c')
+            && text[2..text.len() - 1].bytes().all(|b| b.is_ascii_digit() || b == b';')
+        {
+            self.da1 = true;
+            self.pending.clear();
+            return;
+        }
+        let candidate = text.is_empty() && key.code == KeyCode::Esc
+            || text == "_"
+            || text.starts_with("_G")
+            || text == "["
+            || text.starts_with("[?");
+        if !candidate {
+            self.keys.append(&mut self.pending);
+        }
+    }
+}
+
 /// Reads tty input until the DA1 reply, EOF, a read error or `deadline`.
+#[cfg(any(not(windows), test))]
 fn collect(tty: &mut impl Read, deadline: Instant) -> Report {
     let mut scan = Scan::default();
     let mut pending = Vec::new();
@@ -201,12 +325,14 @@ fn collect(tty: &mut impl Read, deadline: Instant) -> Report {
 
 /// What the probe has learned from tty input so far.
 #[derive(Debug, Default)]
+#[cfg(any(not(windows), test))]
 struct Scan {
     graphics: bool,
     da1: bool,
     keys: Vec<KeyEvent>,
 }
 
+#[cfg(any(not(windows), test))]
 impl Scan {
     /// Consumes every complete token in `buf`, leaving an incomplete tail.
     fn feed(&mut self, buf: &mut Vec<u8>) {
@@ -226,6 +352,7 @@ impl Scan {
 
 /// One unit of tty input, as the probe sees it.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(any(not(windows), test))]
 enum Token {
     /// A kitty graphics reply to [`QUERY`].
     Graphics,
@@ -243,6 +370,7 @@ enum Token {
 /// complete. Keys decode as crossterm decodes them in raw mode, so replayed
 /// typeahead hits the same bindings; rare keys (F-keys, modified arrows) are
 /// skipped rather than replayed.
+#[cfg(any(not(windows), test))]
 fn next_token(buf: &[u8]) -> Option<(Token, usize)> {
     let plain = |code| Token::Key(KeyEvent::new(code, KeyModifiers::NONE));
     let ctrl = |c: u8| Token::Key(KeyEvent::new(KeyCode::Char(char::from(c)), KeyModifiers::CONTROL));
@@ -260,6 +388,7 @@ fn next_token(buf: &[u8]) -> Option<(Token, usize)> {
 }
 
 /// Sequences starting with ESC: replies, special keys, or Alt+key.
+#[cfg(any(not(windows), test))]
 fn escape(buf: &[u8]) -> Option<(Token, usize)> {
     let plain = |code| Token::Key(KeyEvent::new(code, KeyModifiers::NONE));
     match *buf.get(1)? {
@@ -293,6 +422,7 @@ fn escape(buf: &[u8]) -> Option<(Token, usize)> {
 }
 
 /// A CSI sequence: the DA1 reply, a special key, or something to skip.
+#[cfg(any(not(windows), test))]
 fn csi(buf: &[u8]) -> Option<(Token, usize)> {
     // Parameter (0x30–0x3f) and intermediate (0x20–0x2f) bytes, then a final.
     let end = 2 + buf[2..].iter().position(|b| !(0x20..=0x3f).contains(b))?;
@@ -323,6 +453,7 @@ fn csi(buf: &[u8]) -> Option<(Token, usize)> {
 }
 
 /// An APC string (`ESC _ ... ESC \`), the framing of graphics replies.
+#[cfg(any(not(windows), test))]
 fn apc(buf: &[u8]) -> Option<(Token, usize)> {
     let body = &buf[2..];
     let end = body.iter().position(|&b| b == 0x1b || b == 0x07)?;
@@ -350,6 +481,7 @@ fn answers_query(reply: &[u8]) -> bool {
 }
 
 /// A UTF-8 encoded character, `SHIFT`ed when uppercase as crossterm does.
+#[cfg(any(not(windows), test))]
 fn utf8(buf: &[u8]) -> Option<(Token, usize)> {
     let len = match buf[0] {
         0x00..=0x7f => 1,
@@ -378,6 +510,48 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn console_replies_accept_missing_esc_records_and_preserve_typeahead() {
+        for escaped in [false, true] {
+            let mut scan = ConsoleScan::default();
+            let before = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+            let after = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+            scan.feed(before);
+            let text = if escaped { "\x1b_Gi=31;OK\x1b\\\x1b[?62;22c" } else { "_Gi=31;OK\\[?62;22c" };
+            for ch in text.chars() {
+                let code = if ch == '\x1b' { KeyCode::Esc } else { KeyCode::Char(ch) };
+                let key = KeyEvent::new(code, KeyModifiers::NONE);
+                scan.feed(key);
+                scan.feed(KeyEvent::new_with_kind(code, KeyModifiers::NONE, crossterm::event::KeyEventKind::Release));
+            }
+            scan.feed(after);
+            assert!(scan.graphics && scan.da1);
+            assert!(scan.pending.is_empty());
+            assert_eq!(scan.keys, [before, after]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_probe_rejects_wrong_ids_and_bounds_partial_replies() {
+        let mut scan = ConsoleScan::default();
+        for ch in "_Gi=7;OK\\".chars() {
+            scan.feed(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(!scan.graphics);
+        assert!(scan.pending.is_empty() && scan.keys.is_empty(), "unrelated replies are not keystrokes");
+        for _ in 0..600 {
+            scan.feed(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        }
+        assert!(scan.pending.len() <= 512);
+        let mut scan = ConsoleScan::default();
+        for ch in "[?62;22c".chars() {
+            scan.feed(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(scan.da1 && !scan.graphics);
+    }
 
     /// Reads `data` one byte per call, then reports no input pending.
     struct Trickle<'a>(&'a [u8]);
@@ -420,6 +594,36 @@ mod tests {
         assert!(!vivid_advertised(None, s("hunter2")));
         assert!(!vivid_advertised(s(""), s("hunter2")));
         assert!(!vivid_advertised(s("unix:/run/vivid"), s("")));
+    }
+
+    #[test]
+    fn vivido_and_vivida_share_a_category_independent_of_kitty_support() {
+        for program in ["vivido", "Vivido", "vivida", "VIVIDA", "vivid"] {
+            let kind = environment_kind(Some(OsStr::new(program)), None, None);
+            assert_eq!(kind, Kind::Vivid, "{program}");
+            assert_eq!(kind.settle(true), Kind::Vivid);
+            assert_eq!(kind.settle(false), Kind::Vivid);
+        }
+        for program in [
+            None,
+            Some(""),
+            Some("kitty"),
+            Some("ghostty"),
+            Some("cmux"),
+            Some("vivido-other"),
+        ] {
+            let kind = environment_kind(program.map(OsStr::new), None, None);
+            assert_eq!(kind, Kind::Other, "{program:?}");
+            assert_eq!(kind.settle(true), Kind::KittyGraphics);
+        }
+        assert_eq!(
+            environment_kind(
+                None,
+                Some(OsStr::new("endpoint")),
+                Some(OsStr::new("secret"))
+            ),
+            Kind::Vivid
+        );
     }
 
     #[test]
