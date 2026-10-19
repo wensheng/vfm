@@ -1811,12 +1811,10 @@ impl App {
         self.dirty = Dirty::Full;
     }
 
-    /// First rule matching `name`; graphics rules only if the terminal can,
-    /// Vivid rules only inside Vivid.
+    /// First matching rule in the selected terminal profile or shared fallbacks.
     fn match_previewer(&self, name: &str) -> Option<usize> {
         self.cfg.previewers.iter().position(|r| {
-            (self.graphics || !r.graphics)
-                && (self.term == term::Kind::Vivid || !r.vivid)
+            r.supports(self.term, self.graphics, self.cfg.preview.vivido)
                 && r.patterns
                     .iter()
                     .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
@@ -3350,6 +3348,7 @@ mod tests {
         let (mut app, d) = text_preview_app("document-focus", "\0document");
         let executable = std::env::current_exe().unwrap();
         app.cfg.previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
             patterns: vec!["alpha".into()],
             cmd: format!(
                 "\"{}\" --exact preview::tests::interactive_child --ignored --nocapture --",
@@ -3633,6 +3632,7 @@ mod tests {
         std::fs::write(d.join("pic.png"), b"png").unwrap();
         std::fs::write(d.join("notes.txt"), b"text\n").unwrap();
         let previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
             patterns: vec!["*.png".into()],
             cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
             graphics: true,
@@ -4060,6 +4060,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_preview_profiles_override_shared_rules_and_keep_custom_order() {
+        let d = tmpdir("preview-profiles");
+        let file = d.join("config.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[previewer]]
+match = ["*.png", "*.md", "*.txt"]
+run = "shared-text"
+
+[preview.kitty]
+kitim = true
+kitpdf = true
+[[preview.kitty.previewer]]
+match = ["*.png"]
+run = "custom-kitim --preview"
+graphics = true
+[[preview.kitty.previewer]]
+match = ["*.png"]
+run = "later-kitim"
+graphics = true
+
+[preview.vivido]
+vivi = true
+vvrd = true
+[[preview.vivido.previewer]]
+match = ["*.png"]
+run = "custom-vivi --preview"
+vivid = true
+[[preview.vivido.previewer]]
+match = ["*.txt"]
+run = "vivido-text"
+[[preview.vivido.previewer]]
+match = ["*.gif"]
+run = "vivido-kitty-protocol"
+graphics = true
+"#,
+        )
+        .unwrap();
+        let (cfg, err) = Config::load(Some(&file));
+        assert!(err.is_none(), "{err:?}");
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        fn command<'a>(app: &'a App, name: &str) -> Option<&'a str> {
+            app.match_previewer(name)
+                .map(|i| app.cfg.previewers[i].cmd.as_str())
+        }
+        app.set_term(term::Kind::Vivid, None);
+        assert_eq!(command(&app, "pic.png"), Some("custom-vivi --preview"));
+        assert_eq!(command(&app, "doc.pdf"), Some("vvrd --preview"));
+        assert_eq!(command(&app, "README.md"), Some("vvrd --preview"));
+        assert_eq!(command(&app, "notes.txt"), Some("vivido-text"));
+        assert_eq!(command(&app, "clip.gif"), Some("vivi --preview"));
+        app.graphics = true;
+        assert_eq!(command(&app, "clip.gif"), Some("vivido-kitty-protocol"));
+        assert_eq!(command(&app, "pic.png"), Some("custom-vivi --preview"));
+
+        app.set_term(term::Kind::KittyGraphics, None);
+        assert_eq!(command(&app, "pic.png"), Some("custom-kitim --preview"));
+        assert_eq!(command(&app, "clip.gif"), Some("kitim --preview"));
+        assert_eq!(command(&app, "doc.pdf"), Some("kitpdf --preview"));
+        assert_eq!(command(&app, "README.md"), Some("shared-text"));
+        assert_eq!(command(&app, "notes.txt"), Some("shared-text"));
+
+        app.graphics = false;
+        app.set_term(term::Kind::Other, None);
+        assert_eq!(command(&app, "pic.png"), Some("shared-text"));
+        assert_eq!(command(&app, "doc.pdf"), None);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn vivido_inherits_kitty_previews_only_when_its_section_is_absent() {
+        let d = tmpdir("preview-inheritance");
+        let file = d.join("config.toml");
+        for kitty in ["[preview]", "[preview.kitty]"] {
+            for (vivido, image, document) in [
+                ("", Some("kitim --preview"), Some("kitpdf --preview")),
+                ("[preview.vivido]", None, None),
+                ("[preview.vivido]\nvivi=true", Some("vivi --preview"), None),
+            ] {
+                std::fs::write(
+                    &file,
+                    format!("{kitty}\nkitim=true\nkitpdf=true\n{vivido}\n"),
+                )
+                .unwrap();
+                let (cfg, err) = Config::load(Some(&file));
+                assert!(err.is_none(), "{err:?}");
+                let screen = Screen::new(Box::new(io::sink()), 120, 30);
+                let mut app =
+                    App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+                app.sel.file = d.join(".sel");
+                app.set_term(term::Kind::Vivid, None);
+                assert_eq!(
+                    app.match_previewer("doc.pdf")
+                        .map(|i| app.cfg.previewers[i].cmd.as_str()),
+                    None,
+                    "Kitty previews must wait for the graphics probe"
+                );
+                app.graphics = true;
+                for (name, expected) in [("pic.png", image), ("doc.pdf", document)] {
+                    assert_eq!(
+                        app.match_previewer(name)
+                            .map(|i| app.cfg.previewers[i].cmd.as_str()),
+                        expected,
+                        "{kitty}, {vivido}, {name}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[cfg(unix)]
     #[test]
     fn vivid_previews_run_only_in_vivid_get_the_pane_origin_and_hide_under_overlays() {
@@ -4067,6 +4182,7 @@ mod tests {
         // Records its arguments, then every stdin line, in the directory it runs in.
         let script = r#"printf '%s\n' "$@" > args.log; while read -r l; do echo "$l" >> cmds.log; done"#;
         app.cfg.previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
             patterns: vec!["*.png".into()],
             cmd: format!("sh -c '{}' sh", script.replace('\'', r#"'\''"#)),
             graphics: false,
@@ -4086,7 +4202,8 @@ mod tests {
         assert!(args[0].ends_with("pic.png"), "{args:?}");
         app.dirty = Dirty::Full;
         app.render();
-        assert!(!out.take().contains('…'), "a running Vivid preview is not loading");
+        // The directory title may truncate with an ellipsis; check the preview header.
+        assert!(!out.take().contains("pic.png …"), "a running Vivid preview is not loading");
 
         // Page turns while focused; hidden while help covers the pane.
         app.handle_event(special(KeyCode::Right));
@@ -4165,6 +4282,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ui.preview = true;
         cfg.previewers = vec![crate::config::PreviewerRule {
+            scope: Default::default(),
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
             graphics: false,

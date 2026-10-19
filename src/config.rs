@@ -59,14 +59,14 @@ pub struct PreviewCfg {
     pub enabled: bool,
     pub debounce_ms: u64,
     pub max_bytes: usize,
-    /// The built-in kitim plugin: image and video previews, off by default.
-    /// In Vivid, vivi previews them instead.
+    /// Image and video previews through kitim, off by default.
     pub kitim: bool,
-    /// Videos previewed by the kitim (or vivi) plugin play their sound.
+    /// Videos previewed by kitim play their sound.
     pub kitim_sound: bool,
-    /// PDF and EPUB previews with page navigation through kitpdf. In Vivid,
-    /// vvrd previews them instead, and SVG and Markdown files too.
+    /// PDF and EPUB previews with page navigation through kitpdf.
     pub kitpdf: bool,
+    /// An explicit Vivido profile replaces Kitty settings in Vivido and Vivida.
+    pub vivido: bool,
     /// Highlight text previews with bat when it is installed.
     pub bat: bool,
     /// Show line numbers in bat text previews.
@@ -84,6 +84,8 @@ pub struct OpenerRule {
 pub struct PreviewerRule {
     pub patterns: Vec<String>,
     pub cmd: String,
+    /// Terminal profile containing this rule, independent of its output protocol.
+    pub scope: PreviewerScope,
     /// Prints kitty graphics frames, not text (see `graphics`). Only tried
     /// when the terminal answered the graphics probe.
     pub graphics: bool,
@@ -93,6 +95,31 @@ pub struct PreviewerRule {
     pub vivid: bool,
     /// Accepts next/prev/first/last lines on stdin while focused.
     pub interactive: bool,
+}
+
+/// Terminals eligible for a configured previewer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewerScope {
+    /// Shared rules from top-level `[[previewer]]` entries.
+    #[default]
+    Shared,
+    /// Kitty graphics terminals, including Vivido without its own profile.
+    Kitty,
+    /// Vivido and Vivida only.
+    Vivido,
+}
+
+impl PreviewerRule {
+    /// Checks terminal profile selection and the required output protocol.
+    pub fn supports(&self, term: crate::term::Kind, graphics: bool, vivido_profile: bool) -> bool {
+        let vivid = term == crate::term::Kind::Vivid;
+        let selected = match self.scope {
+            PreviewerScope::Shared => true,
+            PreviewerScope::Kitty => graphics && !(vivid && vivido_profile),
+            PreviewerScope::Vivido => vivid,
+        };
+        selected && (graphics || !self.graphics) && (vivid || !self.vivid)
+    }
 }
 
 /// File types kitim previews: what the image crate decodes, plus video
@@ -140,15 +167,30 @@ fn both_cases(types: &[&str]) -> Vec<String> {
 pub fn kitim_rule(sound: bool) -> PreviewerRule {
     let cmd = if sound { "kitim --sound --preview" } else { "kitim --preview" };
     let patterns = both_cases(KITIM_TYPES);
-    PreviewerRule { patterns, cmd: cmd.into(), graphics: true, vivid: false, interactive: false }
+    PreviewerRule {
+        patterns,
+        cmd: cmd.into(),
+        scope: PreviewerScope::Kitty,
+        graphics: true,
+        vivid: false,
+        interactive: false,
+    }
 }
 
-/// kitim's stand-in inside Vivid, added with it: vivi's pane mode, for
-/// the same types. It takes the pane's grid position after its size.
+/// Vivi's pane mode for images and videos in the Vivido profile.
+///
+/// It takes the pane's grid position after its size.
 pub fn vivi_rule(sound: bool) -> PreviewerRule {
     let cmd = if sound { "vivi --sound --preview" } else { "vivi --preview" };
     let patterns = both_cases(KITIM_TYPES);
-    PreviewerRule { patterns, cmd: cmd.into(), graphics: false, vivid: true, interactive: false }
+    PreviewerRule {
+        patterns,
+        cmd: cmd.into(),
+        scope: PreviewerScope::Vivido,
+        graphics: false,
+        vivid: true,
+        interactive: false,
+    }
 }
 
 /// The built-in PDF/EPUB previewer, enabled with `[preview] kitpdf = true`.
@@ -156,18 +198,19 @@ pub fn kitpdf_rule() -> PreviewerRule {
     PreviewerRule {
         patterns: ["*.pdf", "*.PDF", "*.epub", "*.EPUB"].map(String::from).into(),
         cmd: "kitpdf --preview".into(),
+        scope: PreviewerScope::Kitty,
         graphics: true,
         vivid: false,
         interactive: true,
     }
 }
 
-/// kitpdf's stand-in inside Vivid, added with it: vvrd's pane mode, which
-/// also reads SVG and Markdown.
+/// Vvrd's pane mode for PDF, EPUB, SVG, and Markdown in the Vivido profile.
 pub fn vvrd_rule() -> PreviewerRule {
     PreviewerRule {
         patterns: both_cases(VVRD_TYPES),
         cmd: "vvrd --preview".into(),
+        scope: PreviewerScope::Vivido,
         graphics: false,
         vivid: true,
         interactive: true,
@@ -224,6 +267,7 @@ impl Default for Config {
                 kitim: false,
                 kitim_sound: false,
                 kitpdf: false,
+                vivido: false,
                 bat: true,
                 line_numbers: true,
             },
@@ -334,51 +378,70 @@ impl Config {
             get_bool(p, "kitpdf", &mut self.preview.kitpdf);
             get_bool(p, "bat", &mut self.preview.bat);
             get_bool(p, "line_numbers", &mut self.preview.line_numbers);
-        }
-        // [[previewer]] rules
-        if let Some(rules) = t.get("previewer").and_then(|v| v.as_array()) {
-            for r in rules {
-                let Some(tbl) = r.as_table() else { continue };
-                let Some(cmd) = tbl.get("run").and_then(|v| v.as_str()).map(String::from)
-                else {
-                    errs.push("[[previewer]] missing `run`".into());
-                    continue;
-                };
-                let patterns: Vec<String> = tbl
-                    .get("match")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                if patterns.is_empty() {
-                    errs.push("[[previewer]] missing `match`".into());
-                    continue;
+            // Explicit profiles precede shared rules. A missing Vivido profile
+            // inherits Kitty rules; even an empty Vivido table opts out.
+            self.preview.vivido = p.contains_key("vivido");
+            if let Some(value) = p.get("vivido") {
+                if let Some(v) = value.as_table() {
+                    self.previewers.extend(previewer_rules(
+                        v,
+                        "preview.vivido.previewer",
+                        PreviewerScope::Vivido,
+                        &mut errs,
+                    ));
+                    let mut vivi = false;
+                    let mut sound = false;
+                    let mut vvrd = false;
+                    get_bool(v, "vivi", &mut vivi);
+                    get_bool(v, "vivi_sound", &mut sound);
+                    get_bool(v, "vvrd", &mut vvrd);
+                    if vivi {
+                        self.previewers.push(vivi_rule(sound));
+                    }
+                    if vvrd {
+                        self.previewers.push(vvrd_rule());
+                    }
+                } else {
+                    errs.push("[preview.vivido] must be a table".into());
                 }
-                let mut graphics = false;
-                get_bool(tbl, "graphics", &mut graphics);
-                let mut vivid = false;
-                get_bool(tbl, "vivid", &mut vivid);
-                let mut interactive = false;
-                get_bool(tbl, "interactive", &mut interactive);
-                if graphics && vivid {
-                    errs.push("a previewer is either graphics = true or vivid = true".into());
-                    continue;
+            }
+            if let Some(value) = p.get("kitty") {
+                if let Some(k) = value.as_table() {
+                    self.previewers.extend(previewer_rules(
+                        k,
+                        "preview.kitty.previewer",
+                        PreviewerScope::Kitty,
+                        &mut errs,
+                    ));
+                    get_bool(k, "kitim", &mut self.preview.kitim);
+                    get_bool(k, "kitim_sound", &mut self.preview.kitim_sound);
+                    get_bool(k, "kitpdf", &mut self.preview.kitpdf);
+                    if self.preview.kitim {
+                        self.previewers.push(kitim_rule(self.preview.kitim_sound));
+                    }
+                    if self.preview.kitpdf {
+                        self.previewers.push(kitpdf_rule());
+                    }
+                } else {
+                    errs.push("[preview.kitty] must be a table".into());
                 }
-                if interactive && !graphics && !vivid {
-                    errs.push("interactive previewers require graphics = true or vivid = true".into());
-                    continue;
-                }
-                self.previewers.push(PreviewerRule { patterns, cmd, graphics, vivid, interactive });
             }
         }
-        // After the user's rules: first match wins, so theirs take precedence.
-        // Each Vivid rule precedes its kitty one, which Vivid also answers.
-        if self.preview.kitim {
-            self.previewers.push(vivi_rule(self.preview.kitim_sound));
-            self.previewers.push(kitim_rule(self.preview.kitim_sound));
-        }
-        if self.preview.kitpdf {
-            self.previewers.push(vvrd_rule());
-            self.previewers.push(kitpdf_rule());
+        self.previewers.extend(previewer_rules(
+            t,
+            "previewer",
+            PreviewerScope::Shared,
+            &mut errs,
+        ));
+        // Legacy switches remain Kitty defaults, after the user's rules.
+        let kitty_profile = t.get("preview").and_then(|v| v.get("kitty")).is_some();
+        if !kitty_profile {
+            if self.preview.kitim {
+                self.previewers.push(kitim_rule(self.preview.kitim_sound));
+            }
+            if self.preview.kitpdf {
+                self.previewers.push(kitpdf_rule());
+            }
         }
         // [[opener]] definitions
         if let Some(rules) = t.get("opener").and_then(|v| v.as_array()) {
@@ -451,6 +514,62 @@ impl Config {
         }
         errs
     }
+}
+
+/// Parses shared and terminal-specific rules with the same protocol checks.
+fn previewer_rules(
+    t: &toml::Table,
+    section: &str,
+    scope: PreviewerScope,
+    errs: &mut Vec<String>,
+) -> Vec<PreviewerRule> {
+    let mut parsed = Vec::new();
+    let Some(rules) = t.get("previewer").and_then(|v| v.as_array()) else {
+        return parsed;
+    };
+    for r in rules {
+        let Some(tbl) = r.as_table() else { continue };
+        let Some(cmd) = tbl.get("run").and_then(|v| v.as_str()).map(String::from) else {
+            errs.push(format!("[[{section}]] missing `run`"));
+            continue;
+        };
+        let patterns: Vec<String> = tbl
+            .get("match")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if patterns.is_empty() {
+            errs.push(format!("[[{section}]] missing `match`"));
+            continue;
+        }
+        let mut graphics = false;
+        get_bool(tbl, "graphics", &mut graphics);
+        let mut vivid = false;
+        get_bool(tbl, "vivid", &mut vivid);
+        let mut interactive = false;
+        get_bool(tbl, "interactive", &mut interactive);
+        if graphics && vivid {
+            errs.push("a previewer is either graphics = true or vivid = true".into());
+            continue;
+        }
+        if interactive && !graphics && !vivid {
+            errs.push("interactive previewers require graphics = true or vivid = true".into());
+            continue;
+        }
+        parsed.push(PreviewerRule {
+            patterns,
+            cmd,
+            scope,
+            graphics,
+            vivid,
+            interactive,
+        });
+    }
+    parsed
 }
 
 fn get_bool(t: &toml::Table, key: &str, dst: &mut bool) {
@@ -685,14 +804,12 @@ graphics = true
         .parse()
         .unwrap();
         assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 3);
+        assert_eq!(cfg.previewers.len(), 2);
         assert_eq!(cfg.previewers[0].cmd, "my-viewer");
         assert!(cfg.previewers[0].graphics);
-        let vivi = &cfg.previewers[1];
-        assert_eq!((vivi.cmd.as_str(), vivi.vivid, vivi.graphics), ("vivi --preview", true, false));
-        let kitim = &cfg.previewers[2];
+        let kitim = &cfg.previewers[1];
         assert_eq!((kitim.cmd.as_str(), kitim.graphics, kitim.vivid), ("kitim --preview", true, false));
-        assert_eq!(vivi.patterns, kitim.patterns);
+        assert_eq!(kitim.scope, PreviewerScope::Kitty);
         assert!(!cfg.preview.kitim_sound);
         for name in ["*.jpg", "*.JPG", "*.mp4", "*.MOV", "*.gif"] {
             assert!(kitim.patterns.iter().any(|p| p == name), "{name}");
@@ -705,7 +822,7 @@ graphics = true
         let t: toml::Table = "[preview]\nkitim = true\nkitim_sound = true\n".parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert_eq!(cfg.previewers.last().unwrap().cmd, "kitim --sound --preview");
-        assert_eq!(cfg.previewers[0].cmd, "vivi --sound --preview");
+        assert_eq!(cfg.previewers.len(), 1);
         // Without the plugin enabled, the sound switch adds nothing.
         let mut cfg = Config::default();
         let t: toml::Table = "[preview]\nkitim_sound = true\n".parse().unwrap();
@@ -729,15 +846,9 @@ interactive = true
         .parse()
         .unwrap();
         assert!(cfg.apply_table(&t).is_empty());
-        assert_eq!(cfg.previewers.len(), 3);
+        assert_eq!(cfg.previewers.len(), 2);
         assert_eq!(cfg.previewers[0].cmd, "custom --preview");
-        let vvrd = &cfg.previewers[1];
-        assert_eq!(vvrd.cmd, "vvrd --preview");
-        assert!(vvrd.vivid && vvrd.interactive && !vvrd.graphics);
-        for name in ["*.pdf", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.markdown"] {
-            assert!(vvrd.patterns.iter().any(|p| p == name), "{name}");
-        }
-        let rule = &cfg.previewers[2];
+        let rule = &cfg.previewers[1];
         assert_eq!(rule.cmd, "kitpdf --preview");
         assert!(rule.graphics && rule.interactive && !rule.vivid);
         assert_eq!(rule.patterns, ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]);
@@ -750,6 +861,88 @@ interactive = true
         let t: toml::Table = mine.parse().unwrap();
         assert!(cfg.apply_table(&t).is_empty());
         assert!(cfg.previewers[0].vivid && cfg.previewers[0].interactive);
+    }
+
+    #[test]
+    fn terminal_profiles_add_only_their_explicit_viewers() {
+        let mut cfg = Config::default();
+        let t = r#"
+[preview.kitty]
+kitim = true
+kitim_sound = true
+kitpdf = true
+
+[preview.vivido]
+vivi = true
+vivi_sound = true
+vvrd = true
+"#
+        .parse()
+        .unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert!(cfg.preview.vivido);
+        assert_eq!(cfg.previewers.len(), 4);
+        let vivi = &cfg.previewers[0];
+        assert_eq!(vivi.cmd, "vivi --sound --preview");
+        assert!(vivi.vivid && !vivi.graphics && !vivi.interactive);
+        assert_eq!(vivi.scope, PreviewerScope::Vivido);
+        assert_eq!(vivi.patterns, cfg.previewers[2].patterns);
+        let vvrd = &cfg.previewers[1];
+        assert_eq!(vvrd.cmd, "vvrd --preview");
+        assert!(vvrd.vivid && vvrd.interactive && !vvrd.graphics);
+        for name in ["*.pdf", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.markdown"] {
+            assert!(vvrd.patterns.iter().any(|p| p == name), "{name}");
+        }
+        assert_eq!(cfg.previewers[2].cmd, "kitim --sound --preview");
+        assert_eq!(cfg.previewers[3].cmd, "kitpdf --preview");
+    }
+
+    #[test]
+    fn kitty_profile_overrides_legacy_switches_without_duplicate_rules() {
+        let mut cfg = Config::default();
+        let t = "[preview]\nkitim=true\nkitpdf=true\n[preview.kitty]\nkitim=false\n"
+            .parse()
+            .unwrap();
+        assert!(cfg.apply_table(&t).is_empty());
+        assert_eq!(cfg.previewers.len(), 1);
+        assert_eq!(cfg.previewers[0].cmd, "kitpdf --preview");
+        assert!(!cfg.preview.vivido);
+    }
+
+    #[test]
+    fn scoped_previewer_rules_report_their_section_and_validate_protocols() {
+        for section in ["preview.kitty", "preview.vivido"] {
+            for (rule, error) in [
+                (
+                    "match=['*.pdf']",
+                    format!("[[{section}.previewer]] missing `run`"),
+                ),
+                (
+                    "run='viewer'",
+                    format!("[[{section}.previewer]] missing `match`"),
+                ),
+                (
+                    "match=['*.pdf']\nrun='viewer'\ngraphics=true\nvivid=true",
+                    "a previewer is either graphics = true or vivid = true".into(),
+                ),
+                (
+                    "match=['*.pdf']\nrun='viewer'\ninteractive=true",
+                    "interactive previewers require graphics = true or vivid = true".into(),
+                ),
+            ] {
+                let t = format!("[[{section}.previewer]]\n{rule}\n")
+                    .parse()
+                    .unwrap();
+                assert_eq!(Config::default().apply_table(&t), [error]);
+            }
+        }
+        for section in ["kitty", "vivido"] {
+            let t = format!("[preview]\n{section}=false\n").parse().unwrap();
+            assert_eq!(
+                Config::default().apply_table(&t),
+                [format!("[preview.{section}] must be a table")]
+            );
+        }
     }
 
     #[test]

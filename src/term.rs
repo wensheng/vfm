@@ -1,7 +1,7 @@
 //! Host terminal detection: sorts the terminal vfm runs in into a [`Kind`],
 //! and finds out whether it can show kitty graphics.
 //!
-//! Vivid advertises itself through two environment variables, so it is known
+//! Vivido and Vivida advertise their name or Vivid endpoint, so they are known
 //! at once; whether it can show graphics is still probed, like any other
 //! terminal. Kitty graphics support is probed rather than guessed from the
 //! terminal's name, because kitty, Ghostty, Konsole and others all implement
@@ -66,7 +66,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// Terminal category vfm is running inside.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// The Vivid terminal, whether or not it shows graphics.
+    /// Vivido or Vivida, whether or not it shows Kitty graphics.
     Vivid,
     /// Any other terminal that answers the kitty graphics protocol query.
     KittyGraphics,
@@ -130,10 +130,29 @@ impl Probe {
 ///
 /// If the probe thread can't be spawned.
 pub fn detect() -> (Kind, Option<Probe>) {
+    let program = std::env::var_os("TERM_PROGRAM");
     let control = std::env::var_os("VIVID_ENDPOINT_CONTROL");
     let secret = std::env::var_os("VIVID_ROOT_SECRET");
-    let kind = if vivid_advertised(control.as_deref(), secret.as_deref()) { Kind::Vivid } else { Kind::Other };
+    let kind = environment_kind(program.as_deref(), control.as_deref(), secret.as_deref());
     (kind, spawn_probe())
+}
+
+/// Recognizes Vivido and Vivida by name or their advertised Vivid endpoint.
+fn environment_kind(
+    program: Option<&OsStr>,
+    control: Option<&OsStr>,
+    secret: Option<&OsStr>,
+) -> Kind {
+    let named = program.and_then(OsStr::to_str).is_some_and(|p| {
+        ["vivido", "vivida", "vivid"]
+            .iter()
+            .any(|name| p.eq_ignore_ascii_case(name))
+    });
+    if named || vivid_advertised(control, secret) {
+        Kind::Vivid
+    } else {
+        Kind::Other
+    }
 }
 
 /// Whether Vivid's endpoint is advertised: both variables set and non-empty.
@@ -575,6 +594,36 @@ mod tests {
         assert!(!vivid_advertised(None, s("hunter2")));
         assert!(!vivid_advertised(s(""), s("hunter2")));
         assert!(!vivid_advertised(s("unix:/run/vivid"), s("")));
+    }
+
+    #[test]
+    fn vivido_and_vivida_share_a_category_independent_of_kitty_support() {
+        for program in ["vivido", "Vivido", "vivida", "VIVIDA", "vivid"] {
+            let kind = environment_kind(Some(OsStr::new(program)), None, None);
+            assert_eq!(kind, Kind::Vivid, "{program}");
+            assert_eq!(kind.settle(true), Kind::Vivid);
+            assert_eq!(kind.settle(false), Kind::Vivid);
+        }
+        for program in [
+            None,
+            Some(""),
+            Some("kitty"),
+            Some("ghostty"),
+            Some("cmux"),
+            Some("vivido-other"),
+        ] {
+            let kind = environment_kind(program.map(OsStr::new), None, None);
+            assert_eq!(kind, Kind::Other, "{program:?}");
+            assert_eq!(kind.settle(true), Kind::KittyGraphics);
+        }
+        assert_eq!(
+            environment_kind(
+                None,
+                Some(OsStr::new("endpoint")),
+                Some(OsStr::new("secret"))
+            ),
+            Kind::Vivid
+        );
     }
 
     #[test]

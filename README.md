@@ -13,8 +13,9 @@ A small, fast terminal file manager, runs on Linux, macOS and Windows.
   supported) can be a previewer. Image and video previews, through
   [kitim](https://github.com/wensheng/kitim), and PDF/EPUB previews through
   [kitpdf](https://github.com/wensheng/kitpdf), on terminals with kitty graphics.
-  Inside the Vivido terminal, [vivi](https://github.com/vivido-dev/vivi) and
-  [vvrd](https://github.com/vivido-dev/vvrd) take their place.
+  Vivido and Vivida can use a separate profile with
+  [vivi](https://github.com/vivido-dev/vivi) and
+  [vvrd](https://github.com/vivido-dev/vvrd).
 
 ## Install
 
@@ -114,11 +115,19 @@ smartcase = true
 enabled     = true
 debounce_ms = 40
 max_bytes   = 262144      # plugin output beyond this is dropped (marked truncated)
-kitim       = false       # image/video previews via kitim, or vivi in Vivido (see "Built-in plugin: kitim")
-kitim_sound = false       # and play videos' sound in those previews
-kitpdf      = false       # PDF/EPUB previews with page navigation; vvrd in Vivido adds SVG, Markdown
 bat         = true        # highlight text previews with bat (or batcat), if installed
 line_numbers = true       # use bat -n; false uses bat -p without line numbers
+
+[preview.kitty]          # Kitty graphics terminals: kitty, Ghostty, cmux, etc.
+kitim       = false       # image/video previews via kitim
+kitim_sound = false       # play videos' sound in those previews
+kitpdf      = false       # PDF/EPUB previews with page navigation
+
+# Optional: omit this section to use the Kitty settings in Vivido/Vivida.
+[preview.vivido]         # Vivido and Vivida share this profile
+vivi        = false       # image/video previews via vivi
+vivi_sound  = false       # play videos' sound in those previews
+vvrd        = false       # PDF/EPUB/SVG/Markdown previews with page navigation
 
 [colors]                  # name, 0-255, or 0xRRGGBB
 dir = "blue"
@@ -162,6 +171,54 @@ off by default. `VFM_NERD_FONT=1` (or `true`) enables them for a session;
 empty or unrecognized values leave the config unchanged. `NO_COLOR` affects
 colors independently of icons.
 
+### Terminal-specific previews
+
+`[preview.kitty]` configures terminals that answer the Kitty graphics probe,
+including kitty, Ghostty, and cmux. Vivido and Vivida form a separate category
+and use `[preview.vivido]` when it exists. If that section is absent, they use
+the Kitty settings after answering the same graphics probe. An empty Vivido
+section disables this inheritance; omitted or disabled viewers in an explicit
+Vivido section do not fall back to their Kitty counterparts.
+
+For example, this config uses kitim and kitpdf in Kitty graphics terminals,
+and vivi and vvrd in Vivido or Vivida:
+
+```toml
+[preview.kitty]
+kitim = true
+kitpdf = true
+
+[preview.vivido]
+vivi = true
+vvrd = true
+```
+
+Each profile also accepts custom rules. Rules run in their listed order,
+before that profile's built-in viewers. The selected profile takes precedence
+over shared top-level `[[previewer]]` rules, which remain fallbacks in every
+terminal. Use `graphics = true` for Kitty output and `vivid = true` for the
+Vivid side channel; the profile selects the terminal independently of the
+output protocol.
+
+```toml
+[[preview.kitty.previewer]]
+match = ["*.pdf", "*.PDF"]
+run = "/path/to/kitpdf --preview"
+graphics = true
+interactive = true
+
+[[preview.vivido.previewer]]
+match = ["*.pdf", "*.PDF"]
+run = "/path/to/vvrd --preview"
+vivid = true
+interactive = true
+```
+
+The older `[preview] kitim`, `kitim_sound`, and `kitpdf` switches still work as
+Kitty defaults, after shared custom rules. `[preview.kitty]` overrides those
+switches and moves its viewers ahead of shared rules. These switches no longer
+automatically enable vivi or vvrd; enable them explicitly in `[preview.vivido]`.
+
 ## Plugin protocol
 
 **Previewers** run as `<run…> PATH WIDTH HEIGHT`, with stdout piped. vfm parses
@@ -179,7 +236,7 @@ A `[[previewer]]` with `graphics = true` draws images instead of text. It runs
 the same way, as `<run…> PATH WIDTH HEIGHT`, where WIDTH and HEIGHT are the
 pane's body in cells. vfm only uses such a rule if the terminal answered its
 kitty graphics probe at startup, as terminals implementing the protocol do
-(kitty and Ghostty, for example).
+(kitty, Ghostty, and cmux, for example).
 Windows consoles use the same query through VT input, restoring native keyboard
 input afterward; this includes Kitty-capable ConPTY terminals such as Vivida.
 Elsewhere, and inside tmux, the next matching rule or the built-in preview is
@@ -205,8 +262,10 @@ changing the hovered file, or resizing stops the child and closes its pipes.
 
 A `[[previewer]]` with `vivid = true` draws its own picture through the Vivid
 side channel, so vfm reads nothing from its stdout. vfm only uses such a rule
-inside Vivido, which it knows from `VIVID_ENDPOINT_CONTROL` and
-`VIVID_ROOT_SECRET`, and then prefers it to graphics rules after it. It runs as
+inside Vivido or Vivida, recognized by `TERM_PROGRAM` (`vivido`, `vivida`, or
+`vivid`, case-insensitive), or by both `VIVID_ENDPOINT_CONTROL` and
+`VIVID_ROOT_SECRET`. First matching rule wins within the selected profile.
+It runs as
 `<run…> PATH WIDTH HEIGHT COLUMN ROW`: the pane's body size, then its top-left
 cell as a 0-based grid position in the window, for a grid-positioned node.
 
@@ -231,7 +290,7 @@ cargo install --path ../kitpdf
 Run that from the vfm checkout, then add this to `config.toml`:
 
 ```toml
-[preview]
+[preview.kitty]
 kitpdf = true
 ```
 
@@ -247,27 +306,33 @@ a fresh preview. It requires a terminal that answers vfm's Kitty graphics
 probe; other terminals keep their normal fallback preview. Missing kitpdf
 or unreadable documents show an error in the pane.
 
-Inside Vivido, the same switch previews PDF, EPUB, SVG, and Markdown files
-through [vvrd](https://github.com/vivido-dev/vvrd)'s pane mode instead, even
-though Vivido also speaks kitty graphics. Install a vvrd with `--preview` on
-`PATH`. Focus and page keys work the same way, and Enter opens the file in vvrd
-full screen.
+To use [vvrd](https://github.com/vivido-dev/vvrd)'s pane mode inside Vivido or
+Vivida, install a vvrd with `--preview` on `PATH` and add:
 
-The built-in rules are added after custom rules, vvrd's first. To use a
+```toml
+[preview.vivido]
+vvrd = true
+```
+
+This previews PDF, EPUB, SVG, and Markdown files. Without the Vivido section,
+Vivido and Vivida use kitpdf through Kitty graphics. Focus and page keys work
+the same way, and Enter opens the file in vvrd full screen when installed.
+
+The built-in rules are added after custom rules in their profile. To use a
 specific executable, configure the equivalent rule instead:
 
 ```toml
-[[previewer]]
+[[preview.kitty.previewer]]
 match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB"]
 run = "kitpdf --preview"
 graphics = true
 interactive = true
 ```
 
-In Vivido, put vvrd's rule before it:
+For Vivido and Vivida, configure vvrd's rule in their profile:
 
 ```toml
-[[previewer]]
+[[preview.vivido.previewer]]
 match = ["*.pdf", "*.PDF", "*.epub", "*.EPUB", "*.svg", "*.SVG", "*.md", "*.MD"]
 run = "vvrd --preview"
 vivid = true
@@ -281,7 +346,7 @@ The image/video graphics previewer is off by default. Install a
 in `config.toml`:
 
 ```toml
-[preview]
+[preview.kitty]
 kitim = true
 ```
 
@@ -291,24 +356,30 @@ upper case. Animated GIFs and videos loop until you move the cursor. Videos
 are muted unless you also set `kitim_sound = true`; then their sound plays,
 and stops when you move off the file or vfm runs another program.
 
-Inside Vivido, the same switch previews those files through
-[vivi](https://github.com/vivido-dev/vivi)'s pane mode instead (`vivi
---preview`, or `vivi --sound --preview`), even though Vivido also speaks kitty
-graphics. Install a vivi with `--preview` on `PATH`.
-
-That's all the configuration needed. Behind the switch, vfm adds a rule like
-the one below, after your own `[[previewer]]` rules. Don't copy it into your
-config: a rule of yours wins for the files it matches, so it would replace
-the built-in one there, `kitim_sound` included. Write one only to change
-something, such as a kitim that isn't on `PATH` or other file types:
+To use [vivi](https://github.com/vivido-dev/vivi)'s pane mode inside Vivido or
+Vivida, install a vivi with `--preview` on `PATH` and add:
 
 ```toml
-[[previewer]]                        # Vivido only; first, so it wins there
+[preview.vivido]
+vivi = true
+vivi_sound = false       # true runs vivi --sound --preview
+```
+
+Without the Vivido section, Vivido and Vivida use kitim through Kitty graphics.
+
+Behind each switch, vfm adds a rule like the ones below, after your own rules
+in that profile. Don't copy them into your config: a rule of yours wins for
+the files it matches, so it replaces the built-in one there, including the
+profile's sound setting. Write one only to change something, such as a viewer
+that isn't on `PATH` or other file types:
+
+```toml
+[[preview.vivido.previewer]]         # Vivido and Vivida only
 match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
-run      = "vivi --preview"          # "vivi --sound --preview" with kitim_sound
+run      = "vivi --preview"          # "vivi --sound --preview" with vivi_sound
 vivid    = true
 
-[[previewer]]
+[[preview.kitty.previewer]]
 match    = ["*.png", "*.PNG", "*.jpg", "*.JPG", "*.mp4", "*.MP4"] # and the rest
 run      = "kitim --preview"         # "kitim --sound --preview" with kitim_sound
 graphics = true
