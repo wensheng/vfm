@@ -124,7 +124,7 @@ hardlink = "yellow"
 quit = "C-x"
 
 [[previewer]]             # first matching rule wins
-match = ["*.rs", "*.toml", "*.md"]
+kind = ["text"]           # all detected text, including extensionless files
 run   = "my-text-preview --color" # your command or wrapper, accepts PATH WIDTH HEIGHT
 # graphics = true         # run prints kitty graphics, not text (see below)
 # vivid = true            # run draws through Vivid itself (see below)
@@ -157,7 +157,7 @@ colors independently of icons.
 
 ### Terminal-specific previews
 
-Every external preview is an explicit rule with filename globs and a command.
+Every external preview is an explicit rule with content or filename selectors and a command.
 vfm does not associate executables, options, or extensions with a terminal.
 It selects a terminal profile, finds the first matching rule, and runs that
 rule using the chosen output protocol.
@@ -169,17 +169,47 @@ Kitty rules after answering the graphics probe. When a Vivido section exists,
 its rules replace the Kitty profile, including for extensions it does not
 list. An empty `[preview.vivido]` disables inheritance too.
 
+Previewer rules accept any combination of these selectors (a match on any one
+is enough), in every terminal profile:
+
+```toml
+kind = ["image", "video"]          # broad detected categories
+mime = ["application/pdf"]         # detected MIME types, with glob support
+match = ["*.svg", "*.SVG"]         # filename globs, as before
+```
+
+`kind` accepts `text`, `image`, `video`, `audio`, `document`, `archive`, `font`,
+`executable`, and `binary` (other binary data). `mime = ["image/*"]`
+matches detected image MIME types; `kind = ["document"]` covers recognized
+PDF, RTF, ebook, and Office formats. Use exact MIME selectors when a program
+only supports some of those documents.
+
+Detection reads at most 8 KiB of the file's content, only when a rule needs it.
+It uses `infer` signatures, then the existing NUL/control-byte heuristic for
+unrecognized text. Plain text, source code, JSON, and other text without a
+recognized signature receive `text/plain`; `kind = ["text"]` covers all of
+them, including empty files, dotfiles, and files without extensions. Directories
+and special files never match content selectors; symlinks follow their targets.
+UTF-16/UTF-32 text containing NUL bytes is classified as binary.
+
+Signature detection is best effort: unsupported formats and container contents
+beyond the inspected head may need filename globs. The small `infer` build
+omits its CFB parser, so legacy Office containers share
+`application/x-ole-storage` and the `document` category. SVG and Markdown can
+still use filename globs for a specialized renderer. Put specific rules before
+broader rules, since the first matching rule still wins.
+
 For example, the following configuration chooses these commands for PDFs:
 
 ```toml
 [[preview.kitty.previewer]]
-match = ["*.pdf", "*.PDF"]
+mime = ["application/pdf"]
 run = "kitpdf --preview"
 graphics = true
 interactive = true
 
 [[preview.vivido.previewer]]
-match = ["*.pdf", "*.PDF"]
+mime = ["application/pdf"]
 run = "vvrd --preview"
 vivid = true
 interactive = true
@@ -195,7 +225,7 @@ vfm does not substitute another executable.
 
 See [config.example.toml](config.example.toml) for complete image, video,
 document, and text rules using kitim, kitpdf, vivi, vvrd, and bat. All program
-names, extension lists, audio flags, highlighting options, and line-number
+names, selectors, audio flags, highlighting options, and line-number
 options live in that file. Copy the rules you need and change the commands
 and patterns to suit your installed programs.
 
@@ -219,8 +249,8 @@ this POSIX shell rule passes only the path to bat:
 
 ```toml
 [[previewer]]
-match = ["*.rs", "*.toml", "*.txt"]
-run = """sh -c 'exec bat --color=always --paging=never --wrap=never -n -- "$1"' sh"""
+kind = ["text"]
+run = """sh -c 'exec bat --color=always --decorations=always --paging=never --wrap=never -n -- "$1"' sh"""
 ```
 
 ### Graphics previewers

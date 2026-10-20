@@ -19,6 +19,7 @@
 //! their stderr is kept as the message if they exit on their own.
 
 use crate::ansi::AnsiFeeder;
+use crate::filetype::looks_binary;
 use crate::graphics::{Frame, Splitter};
 use crate::sort::natural_cmp;
 use crate::ui::Line;
@@ -42,9 +43,6 @@ const VIVID_GRACE: Duration = Duration::from_millis(300);
 /// Most stderr kept from a Vivid previewer: room for an error line.
 const MAX_MESSAGE: usize = 512;
 const READ_BUF: usize = 64 * 1024;
-
-/// Bytes of a file's head checked to tell text from binary.
-const SNIFF_BYTES: usize = 8192;
 
 // ---------------------------------------------------------------- signature
 
@@ -659,13 +657,7 @@ impl Preview {
 /// followed, so their target opens — whose head reads as text. Directories
 /// and special files are not; their heads aren't read, so pipes can't stall.
 pub fn opens_as_text(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file()) && head_is_text(path)
-}
-
-fn head_is_text(path: &Path) -> bool {
-    let Ok(f) = std::fs::File::open(path) else { return false };
-    let mut head = Vec::with_capacity(SNIFF_BYTES);
-    f.take(SNIFF_BYTES as u64).read_to_end(&mut head).is_ok() && !looks_binary(&head)
+    crate::filetype::detect_path(path).is_some_and(|ty| ty.kind == crate::filetype::Kind::Text)
 }
 
 // ---------------------------------------------------------------- builtin
@@ -746,19 +738,6 @@ fn builtin_file(path: &Path, max_bytes: usize) -> (Vec<Line>, bool) {
     feeder.feed(&data);
     feeder.finish();
     (feeder.take_lines(), truncated)
-}
-
-/// NUL in the head, or >10% control bytes, means "don't pretend this is text".
-fn looks_binary(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(SNIFF_BYTES)];
-    if head.contains(&0) {
-        return true;
-    }
-    if head.is_empty() {
-        return false;
-    }
-    let ctrl = head.iter().filter(|&&b| b < 0x09 || (0x0e..0x20).contains(&b)).count();
-    ctrl * 10 > head.len()
 }
 
 fn sniff_kind(data: &[u8]) -> &'static str {
@@ -861,6 +840,8 @@ mod tests {
         assert!(opens_as_text(&d.join("t.txt")));
         assert!(opens_as_text(&d.join("empty")));
         assert!(!opens_as_text(&d.join("b.dat")));
+        std::fs::write(d.join("document"), b"%PDF-1.7\n").unwrap();
+        assert!(!opens_as_text(&d.join("document")));
         assert!(!opens_as_text(&d)); // a directory
         #[cfg(unix)]
         {

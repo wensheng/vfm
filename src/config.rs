@@ -17,7 +17,7 @@ pub struct Config {
     pub filter: FilterCfg,
     pub preview: PreviewCfg,
     pub theme: Theme,
-    /// Extension/filename globs → preview command, first match wins.
+    /// Filename, category, or MIME selectors → preview command, first match wins.
     pub previewers: Vec<PreviewerRule>,
     /// Extension/filename globs → fullscreen open command, first match wins.
     pub openers: Vec<OpenerRule>,
@@ -73,6 +73,8 @@ pub struct OpenerRule {
 #[derive(Clone, Debug)]
 pub struct PreviewerRule {
     pub patterns: Vec<String>,
+    pub kinds: Vec<crate::filetype::Kind>,
+    pub mimes: Vec<String>,
     pub cmd: String,
     /// Terminal profile containing this rule, independent of its output protocol.
     pub scope: PreviewerScope,
@@ -395,17 +397,33 @@ fn previewer_rules(
             errs.push(format!("[[{section}]] missing `run`"));
             continue;
         };
-        let patterns: Vec<String> = tbl
-            .get("match")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if patterns.is_empty() {
-            errs.push(format!("[[{section}]] missing `match`"));
+        let selectors = ["match", "kind", "mime"].map(|key| match tbl.get(key) {
+            None => Some(Vec::new()),
+            Some(toml::Value::Array(a)) => a.iter().map(|v| v.as_str().map(String::from)).collect(),
+            _ => None,
+        });
+        let [Some(patterns), Some(kind_names), Some(mimes)] = selectors else {
+            errs.push(format!(
+                "[[{section}]] `match`, `kind`, and `mime` must be arrays of strings"
+            ));
+            continue;
+        };
+        let mut kinds = Vec::new();
+        let mut valid = true;
+        for name in &kind_names {
+            match crate::filetype::Kind::parse(name) {
+                Some(kind) => kinds.push(kind),
+                None => {
+                    errs.push(format!("[[{section}]] unknown kind `{name}`"));
+                    valid = false;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+        if patterns.is_empty() && kinds.is_empty() && mimes.is_empty() {
+            errs.push(format!("[[{section}]] needs `match`, `kind`, or `mime`"));
             continue;
         }
         let mut graphics = false;
@@ -424,6 +442,8 @@ fn previewer_rules(
         }
         parsed.push(PreviewerRule {
             patterns,
+            kinds,
+            mimes,
             cmd,
             scope,
             graphics,
@@ -709,6 +729,54 @@ vivid = true
     }
 
     #[test]
+    fn previewer_content_selectors_parse_and_validate_in_every_scope() {
+        for section in [
+            "previewer",
+            "preview.kitty.previewer",
+            "preview.vivido.previewer",
+        ] {
+            let mut cfg = Config::default();
+            let t = format!("[[{section}]]\nkind=['text','image','document']\nmime=['video/*','application/pdf']\nrun='viewer'\n").parse().unwrap();
+            assert!(cfg.apply_table(&t).is_empty());
+            let rule = &cfg.previewers[0];
+            assert!(rule.patterns.is_empty());
+            assert_eq!(
+                rule.kinds,
+                [
+                    crate::filetype::Kind::Text,
+                    crate::filetype::Kind::Image,
+                    crate::filetype::Kind::Document
+                ]
+            );
+            assert_eq!(rule.mimes, ["video/*", "application/pdf"]);
+
+            for (selectors, error) in [
+                ("kind=['typo']", "unknown kind `typo`"),
+                (
+                    "kind='text'",
+                    "`match`, `kind`, and `mime` must be arrays of strings",
+                ),
+                (
+                    "mime=[false]",
+                    "`match`, `kind`, and `mime` must be arrays of strings",
+                ),
+                (
+                    "match=[1]",
+                    "`match`, `kind`, and `mime` must be arrays of strings",
+                ),
+                ("kind=[]\nmime=[]", "needs `match`, `kind`, or `mime`"),
+            ] {
+                let mut cfg = Config::default();
+                let t = format!("[[{section}]]\n{selectors}\nrun='viewer'\n")
+                    .parse()
+                    .unwrap();
+                assert_eq!(cfg.apply_table(&t), [format!("[[{section}]] {error}")]);
+                assert!(cfg.previewers.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn previewer_lists_reject_invalid_shapes_in_every_scope() {
         for prefix in ["", "preview.kitty.", "preview.vivido."] {
             let section = format!("{prefix}previewer");
@@ -731,11 +799,10 @@ vivid = true
         assert!(cfg.apply_table(&t).is_empty());
         assert!(cfg.preview.vivido);
         assert_eq!(cfg.previewers.len(), 5);
-        assert!(
-            cfg.previewers
-                .iter()
-                .all(|r| !r.patterns.is_empty() && !r.cmd.is_empty())
-        );
+        assert!(cfg.previewers.iter().all(|r| (!r.patterns.is_empty()
+            || !r.kinds.is_empty()
+            || !r.mimes.is_empty())
+            && !r.cmd.is_empty()));
     }
 
     #[test]
@@ -748,7 +815,7 @@ vivid = true
                 ),
                 (
                     "run='viewer'",
-                    format!("[[{section}.previewer]] missing `match`"),
+                    format!("[[{section}.previewer]] needs `match`, `kind`, or `mime`"),
                 ),
                 (
                     "match=['*.pdf']\nrun='viewer'\ngraphics=true\nvivid=true",

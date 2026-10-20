@@ -11,6 +11,7 @@ crossterm = "0.29"
 unicode-width = "0.2"
 toml = "1"
 regex-lite = "0.1"
+infer = { version = "0.22", default-features = false }
 trash = { version = "5", optional = true }
 
 [target.'cfg(unix)'.dependencies]

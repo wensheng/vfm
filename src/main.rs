@@ -10,6 +10,7 @@ mod config;
 mod context;
 mod dir;
 mod entry;
+mod filetype;
 mod filter;
 mod graphics;
 mod ops;

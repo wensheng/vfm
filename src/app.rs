@@ -1791,11 +1791,37 @@ impl App {
 
     /// First matching rule in the selected terminal profile or shared fallbacks.
     fn match_previewer(&self, name: &str) -> Option<usize> {
+        // Read at most one head, only if an eligible rule needs content detection.
+        // Use the raw hovered path so non-UTF-8 names remain previewable too.
+        let detected = std::cell::OnceCell::new();
         self.cfg.previewers.iter().position(|r| {
-            r.supports(self.term, self.graphics, self.cfg.preview.vivido)
-                && r.patterns
-                    .iter()
-                    .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
+            if !r.supports(self.term, self.graphics, self.cfg.preview.vivido) {
+                return false;
+            }
+            if r.patterns
+                .iter()
+                .any(|p| crate::util::glob_match(p.as_bytes(), name.as_bytes()))
+            {
+                return true;
+            }
+            if r.kinds.is_empty() && r.mimes.is_empty() {
+                return false;
+            }
+            detected
+                .get_or_init(|| {
+                    let path = if self.dir.hovered_name() == Some(name) {
+                        self.dir.hovered_path()?
+                    } else {
+                        self.dir.path.join(name)
+                    };
+                    crate::filetype::detect_path(&path)
+                })
+                .is_some_and(|ty| {
+                    r.kinds.contains(&ty.kind)
+                        || r.mimes
+                            .iter()
+                            .any(|m| crate::util::glob_match(m.as_bytes(), ty.mime.as_bytes()))
+                })
         })
     }
 
@@ -3283,7 +3309,9 @@ mod tests {
         app.set_cursor(index);
         app.cfg.previewers.push(crate::config::PreviewerRule {
             scope: Default::default(),
-            patterns: vec!["alpha".into()],
+            kinds: vec![crate::filetype::Kind::Text],
+            mimes: Vec::new(),
+            patterns: Vec::new(),
             cmd: r#"sh -c 'cat "$1"' sh"#.into(),
             graphics: false,
             vivid: false,
@@ -3331,6 +3359,8 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         app.cfg.previewers = vec![crate::config::PreviewerRule {
             scope: Default::default(),
+            kinds: Vec::new(),
+            mimes: Vec::new(),
             patterns: vec!["alpha".into()],
             cmd: format!(
                 "\"{}\" --exact preview::tests::interactive_child --ignored --nocapture --",
@@ -3615,6 +3645,8 @@ mod tests {
         std::fs::write(d.join("notes.txt"), b"text\n").unwrap();
         let previewers = vec![crate::config::PreviewerRule {
             scope: Default::default(),
+            kinds: Vec::new(),
+            mimes: Vec::new(),
             patterns: vec!["*.png".into()],
             cmd: r#"sh -c "printf '\033_Ga=T,i=%s%s;AAAA\033\\\\' \"\$2\" \"\$3\"" sh"#.into(),
             graphics: true,
@@ -4041,6 +4073,93 @@ mod tests {
     }
 
     #[test]
+    fn content_preview_rules_use_bytes_and_preserve_order_and_profiles() {
+        let d = tmpdir("content-preview-rules");
+        for (name, data) in [
+            ("source", &b"fn main() {}\n"[..]),
+            (".dotfile", &b"plain text\n"[..]),
+            ("empty", &b""[..]),
+            ("picture.txt", &b"\x89PNG\r\n\x1a\n"[..]),
+            ("document", &b"%PDF-1.7\n"[..]),
+            ("opaque", &b"\0binary"[..]),
+            ("custom.xyz", &b"\0binary"[..]),
+        ] {
+            std::fs::write(d.join(name), data).unwrap();
+        }
+        std::fs::create_dir(d.join("folder.txt")).unwrap();
+        let config = d.join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+    [[preview.vivido.previewer]]
+    kind = ["image"]
+    run = "vivid-image"
+    vivid = true
+
+    [[preview.kitty.previewer]]
+    mime = ["image/*"]
+    run = "kitty-image"
+    graphics = true
+
+    [[previewer]]
+    mime = ["application/pdf"]
+    match = ["*.xyz"]
+    run = "document-or-custom"
+
+    [[previewer]]
+    kind = ["document"]
+    run = "later-document"
+
+    [[previewer]]
+    kind = ["text"]
+    run = "text"
+    "#,
+        )
+        .unwrap();
+        let (mut cfg, err) = Config::load(Some(&config));
+        assert!(err.is_none(), "{err:?}");
+        cfg.ui.show_hidden = true;
+        let screen = Screen::new(Box::new(io::sink()), 120, 30);
+        let mut app = App::new(cfg, d.clone(), screen, Box::new(TestSource::new())).unwrap();
+        app.sel.file = d.join(".sel");
+        let command = |app: &App, name: &str| {
+            app.match_previewer(name)
+                .map(|i| app.cfg.previewers[i].cmd.clone())
+        };
+        for name in ["source", ".dotfile", "empty"] {
+            assert_eq!(command(&app, name).as_deref(), Some("text"));
+        }
+        for name in ["document", "custom.xyz"] {
+            assert_eq!(command(&app, name).as_deref(), Some("document-or-custom"));
+        }
+        for name in ["picture.txt", "opaque", "folder.txt", "missing"] {
+            assert_eq!(command(&app, name), None, "{name}");
+        }
+        app.graphics = true;
+        app.set_term(term::Kind::KittyGraphics, None);
+        assert_eq!(command(&app, "picture.txt").as_deref(), Some("kitty-image"));
+        app.set_term(term::Kind::Vivid, None);
+        assert_eq!(command(&app, "picture.txt").as_deref(), Some("vivid-image"));
+        assert_eq!(command(&app, "source").as_deref(), Some("text"));
+
+        // Exercise navigation through the configured text rule, not just matching.
+        app.dir.cursor = app
+            .dir
+            .entries
+            .iter()
+            .position(|e| &*e.name == "source")
+            .unwrap();
+        app.preview.enabled = true;
+        app.preview.debounce = Duration::ZERO;
+        app.preview_on_hover();
+        app.apply(Action::NavIn);
+        assert!(app.preview_focused);
+        app.apply(Action::Back);
+        assert!(!app.preview_focused);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
     fn terminal_preview_profiles_override_shared_rules_and_keep_custom_order() {
         let d = tmpdir("preview-profiles");
         let file = d.join("config.toml");
@@ -4193,6 +4312,8 @@ vivid = true
         let script = r#"printf '%s\n' "$@" > args.log; while read -r l; do echo "$l" >> cmds.log; done"#;
         app.cfg.previewers = vec![crate::config::PreviewerRule {
             scope: Default::default(),
+            kinds: Vec::new(),
+            mimes: Vec::new(),
             patterns: vec!["*.png".into()],
             cmd: format!("sh -c '{}' sh", script.replace('\'', r#"'\''"#)),
             graphics: false,
@@ -4263,6 +4384,8 @@ vivid = true
         cfg.ui.preview = true;
         cfg.previewers = vec![crate::config::PreviewerRule {
             scope: Default::default(),
+            kinds: Vec::new(),
+            mimes: Vec::new(),
             patterns: vec!["*.txt".into()],
             cmd: "cat".into(),
             graphics: false,
