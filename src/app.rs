@@ -94,6 +94,9 @@ const ANIMATION_TICK: Duration = Duration::from_millis(15);
 /// far the divider moves, so neither pane is dragged out of sight.
 const MIN_SIDE_COLS: u16 = 20;
 
+/// Maximum buffer entries, including the overflow summary; the header is separate.
+const COPY_BUFFER_ROWS: usize = 5;
+
 /// `<` / `>` steps across the screen width: 5% per press.
 const DIVIDER_STEPS: u16 = 20;
 
@@ -579,6 +582,11 @@ impl App {
                     self.last_click = None;
                     return Action::Click { row: m.row, col: m.column, kind: ClickKind::Single };
                 }
+                // The selection buffer and other non-list rows never open files on double click.
+                if self.row_to_index(m.row).is_none() {
+                    self.last_click = None;
+                    return Action::Resize;
+                }
                 let now = Instant::now();
                 let double = self
                     .last_click
@@ -623,7 +631,7 @@ impl App {
             self.preview_focused = false;
             self.dirty = Dirty::Full;
         }
-        let rows = self.screen.list_rows() as isize;
+        let rows = self.file_rows() as isize;
         match action {
             Action::Next => self.move_cursor(1),
             Action::Prev => self.move_cursor(-1),
@@ -882,8 +890,8 @@ impl App {
             // Keep navigating while filtering (nnn allows arrows mid-filter).
             Action::Next => self.move_cursor(1),
             Action::Prev => self.move_cursor(-1),
-            Action::PgDn => self.move_cursor(self.screen.list_rows() as isize),
-            Action::PgUp => self.move_cursor(-(self.screen.list_rows() as isize)),
+            Action::PgDn => self.move_cursor(self.file_rows() as isize),
+            Action::PgUp => self.move_cursor(-(self.file_rows() as isize)),
             Action::Home => self.set_cursor(0),
             Action::End => self.set_cursor(self.dir.nvisible().saturating_sub(1)),
             // The divider can be dragged while filtering too.
@@ -1370,6 +1378,8 @@ impl App {
     }
 
     fn persist_sel(&mut self) {
+        // Selection changes resize the listing and redraw the buffer as one frame.
+        self.dirty = Dirty::Full;
         if let Err(e) = self.sel.write_sel() {
             self.notify(format!("selection file: {e}"));
         }
@@ -1963,11 +1973,11 @@ impl App {
     }
 
     fn row_to_index(&self, row: u16) -> Option<usize> {
-        let top = 2u16;
-        if row < top {
+        let offset = row.checked_sub(2)? as usize;
+        if offset >= self.file_rows() {
             return None;
         }
-        let i = self.dir.scroll + (row - top) as usize;
+        let i = self.dir.scroll + offset;
         (i < self.dir.nvisible()).then_some(i)
     }
 
@@ -2057,13 +2067,14 @@ impl App {
     /// derived (`scroll_adjust`), so derive it now: moving within the
     /// scrolloff band can shift the window even by one row.
     fn fast_two_lines_ok(&mut self) -> bool {
+        let rows = self.file_rows();
         matches!(self.mode, Mode::Normal | Mode::Filter)
-            && self.dir.scroll_adjust(self.screen.list_rows(), self.cfg.ui.scrolloff) == self.last_scroll
+            && self.dir.scroll_adjust(rows, self.cfg.ui.scrolloff) == self.last_scroll
     }
 
     /// Emit just the old + new cursor rows (+ statusbar).
     fn fast_two_lines(&mut self) {
-        let rows = self.screen.list_rows();
+        let rows = self.file_rows();
         let theme = self.cfg.theme.clone();
         let (w, detail) = (self.pane_width(), self.detail);
         let mut old = None;
@@ -2107,6 +2118,73 @@ impl App {
         }
     }
 
+    /// Rows reserved for the buffer, keeping at least one directory row on short screens.
+    fn copy_buffer_rows(&self) -> usize {
+        let available = self.screen.list_rows().saturating_sub(1);
+        if self.sel.is_empty() || available < 2 {
+            return 0;
+        }
+        1 + self.sel.len().min(COPY_BUFFER_ROWS).min(available - 1)
+    }
+
+    /// Directory rows only; the preview keeps its full independent height.
+    fn file_rows(&self) -> usize {
+        self.screen
+            .list_rows()
+            .saturating_sub(self.copy_buffer_rows())
+    }
+
+    fn render_copy_buffer(&mut self, width: usize) {
+        let rows = self.copy_buffer_rows();
+        if rows == 0 {
+            return;
+        }
+        let theme = &self.cfg.theme;
+        let top = (2 + self.file_rows()) as u16;
+        let header = Line::styled(
+            format!(" Copy/move buffer [{}]", self.sel.len()),
+            theme.ctx_active,
+        );
+        self.screen.put_line(top, &header, width, theme.ctx_active);
+        let slots = rows - 1;
+        let shown = if self.sel.len() > slots {
+            slots - 1
+        } else {
+            slots
+        };
+        for (i, path) in self.sel.items().iter().take(shown).enumerate() {
+            let name = path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy();
+            let mut spans = vec![Span {
+                text: format!(" {}", crate::ui::sanitize(&name)),
+                style: Style::default(),
+            }];
+            if let Some(parent) = path.parent().filter(|p| *p != self.dir.path) {
+                let source = crate::ui::sanitize(&tilde_path(parent, self.home.as_deref()));
+                spans.push(Span {
+                    text: format!("  {source}"),
+                    style: theme.preview_meta,
+                });
+            }
+            self.screen.put_line(
+                top + 1 + i as u16,
+                &Line::from_spans(spans),
+                width,
+                Style::default(),
+            );
+        }
+        if self.sel.len() > shown {
+            let more = Line::styled(
+                format!(" {} items more", self.sel.len() - shown),
+                theme.preview_meta,
+            );
+            self.screen
+                .put_line(top + 1 + shown as u16, &more, width, Style::default());
+        }
+    }
+
     fn render_full(&mut self) {
         let theme = self.cfg.theme.clone();
         let (w, h) = (self.screen.w, self.screen.h);
@@ -2125,7 +2203,7 @@ impl App {
         self.screen.put_line(1, &path_line, pw, theme.statusbar);
 
         // Listing rows.
-        let rows = self.screen.list_rows();
+        let rows = self.file_rows();
         self.dir.ensure_sorted();
         let scroll = self.dir.scroll_adjust(rows, self.cfg.ui.scrolloff);
         self.last_scroll = scroll;
@@ -2145,10 +2223,13 @@ impl App {
         for r in row..2 + rows as u16 {
             self.screen.put_line(r, &blank, pw, Style::default());
         }
-        if self.dir.nvisible() == 0 {
+        if self.dir.nvisible() == 0 && rows > 0 {
             let text = if self.dir.is_empty() { "(empty)" } else { "(no matches)" };
             self.screen.put_text(2, 0, text, theme.divider, pw);
         }
+
+        // The copy/move buffer shares the listing's width, never the preview's height.
+        self.render_copy_buffer(pw);
 
         // Preview pane (right of the divider).
         if let Some((pane_w, _)) = self.preview_pane() {
@@ -2731,7 +2812,8 @@ mod tests {
         let d = std::env::temp_dir().join(format!("vfm-app-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        // App::new canonicalizes its start path, including macOS temp aliases.
+        std::fs::canonicalize(d).unwrap()
     }
 
     fn test_app(name: &str) -> (App, PathBuf) {
@@ -3087,6 +3169,170 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_buffer_caps_entries_and_counts_every_hidden_item() {
+        let (mut app, d) = test_app("buffer-counts");
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 80, 18);
+        for count in [0, 1, 5, 6, 9] {
+            app.sel.clear();
+            for i in 0..count {
+                app.sel.add(&d.join(format!("queued-{i}")));
+            }
+            app.dirty = Dirty::Full;
+            app.render();
+            let frame = out.take();
+            assert_eq!(
+                app.copy_buffer_rows(),
+                if count == 0 { 0 } else { count.min(5) + 1 }
+            );
+            assert_eq!(
+                app.file_rows() + app.copy_buffer_rows(),
+                app.screen.list_rows()
+            );
+            assert_eq!(frame.contains("Copy/move buffer"), count > 0);
+            if count <= 5 {
+                assert!(!frame.contains("items more"));
+                for i in 0..count {
+                    assert!(frame.contains(&format!("queued-{i}")));
+                }
+            } else {
+                assert!(frame.contains(&format!("{} items more", count - 4)));
+                assert!(frame.contains("queued-3"));
+                assert!(!frame.contains("queued-4"));
+            }
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// A text segment emitted at an exact screen position, without style escapes.
+    fn rendered_segment(frame: &str, row: usize, column: usize) -> String {
+        let marker = format!("\x1b[{};{}H", row + 1, column + 1);
+        let (_, segment) = frame
+            .rsplit_once(&marker)
+            .unwrap_or_else(|| panic!("missing screen position {row},{column}"));
+        let moves = regex_lite::Regex::new(r"\x1b\[[0-9;]*H").unwrap();
+        let end = moves.find(segment).map_or(segment.len(), |m| m.start());
+        let styles = regex_lite::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+        styles.replace_all(&segment[..end], "").into_owned()
+    }
+
+    #[test]
+    fn copy_buffer_follows_the_divider_without_shortening_the_preview() {
+        let text: String = (0..40).map(|i| format!("preview {i:02}\n")).collect();
+        let (mut app, d) = text_preview_app("buffer-preview", &text);
+        let out = SharedBuf::default();
+        app.screen = Screen::new(Box::new(out.clone()), 120, 30);
+        app.sel
+            .add(&d.join("你好-very-long-queued-name-that-does-not-fit-on-a-narrow-pane.txt"));
+        for _ in 0..8 {
+            app.dirty = Dirty::Full;
+            app.render();
+            let frame = out.take();
+            let width = app.pane_width();
+            let top = 2 + app.file_rows();
+            let header = rendered_segment(&frame, top, 0);
+            let item = rendered_segment(&frame, top + 1, 0);
+            assert_eq!(crate::ui::str_width(&header), width);
+            assert_eq!(crate::ui::str_width(&item), width);
+            let (preview_width, _) = app.preview_pane().unwrap();
+            let x = usize::from(app.screen.w - preview_width) + 1;
+            assert!(rendered_segment(&frame, 28, x).contains("preview 26"));
+            assert_eq!(app.screen.list_rows(), 27);
+            app.apply(Action::PreviewWider);
+        }
+        // The same buffer fills the listing's whole width when preview is closed.
+        app.apply(Action::TogglePreview);
+        app.render();
+        let frame = out.take();
+        assert_eq!(
+            crate::ui::str_width(&rendered_segment(&frame, 2 + app.file_rows(), 0)),
+            120
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn copy_buffer_rows_are_excluded_from_paging_scrolling_and_mouse_hits() {
+        let (mut app, d) = test_app("buffer-navigation");
+        for i in 0..40 {
+            std::fs::write(d.join(format!("file-{i:02}")), b"").unwrap();
+        }
+        app.reload_dir();
+        app.screen.resize(80, 15);
+        app.apply(Action::SelectAll);
+        app.render();
+        let page = app.file_rows();
+        assert_eq!(page, 6);
+        let start = app.dir.cursor;
+        app.apply(Action::PgDn);
+        assert_eq!(app.dir.cursor, start + page);
+        app.render();
+        app.apply(Action::PgUp);
+        assert_eq!(app.dir.cursor, start);
+        app.apply(Action::End);
+        app.render();
+        assert!(app.dir.cursor >= app.dir.scroll && app.dir.cursor < app.dir.scroll + page);
+        let cursor = app.dir.cursor;
+        let top = (2 + app.file_rows()) as u16;
+        for row in top..app.screen.h {
+            assert_eq!(app.row_to_index(row), None);
+            for _ in 0..2 {
+                app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, row));
+            }
+            app.on_click(row, 1, ClickKind::Right);
+            assert_eq!(app.dir.cursor, cursor);
+        }
+        // Resize down to a short terminal: leave one navigable file row.
+        app.screen.resize(80, 7);
+        app.dirty = Dirty::Full;
+        app.render();
+        assert_eq!(app.file_rows(), 1);
+        assert_eq!(app.copy_buffer_rows(), 3);
+        assert_eq!(app.row_to_index(2), Some(app.dir.cursor));
+        app.screen.resize(80, 5);
+        assert_eq!(app.copy_buffer_rows(), 0);
+        assert_eq!(app.file_rows(), 2);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn copy_buffer_tracks_copy_move_and_selection_clear() {
+        let (mut app, d) = test_app("buffer-operations");
+        let source = d.join("alpha");
+        app.dir.move_to_name("alpha");
+        app.apply(Action::Select);
+        assert_eq!(app.sel.items(), std::slice::from_ref(&source));
+        assert!(app.copy_buffer_rows() > 0);
+        app.cd(&d.join("subdir"));
+        app.apply(Action::Copy);
+        let wait = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while app.op.is_some() {
+                assert!(Instant::now() < deadline, "file operation did not finish");
+                app.render();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait(&mut app);
+        assert!(d.join("subdir/alpha").exists());
+        assert_eq!(app.sel.len(), 1);
+        let dest = d.join("subdir/destination");
+        std::fs::create_dir(&dest).unwrap();
+        app.cd(&dest);
+        app.apply(Action::Move);
+        wait(&mut app);
+        assert!(dest.join("alpha").exists());
+        assert!(!source.exists());
+        assert_eq!(app.copy_buffer_rows(), 0);
+        app.apply_replies(&[Reply::SelectAdd(dest.join("alpha"))]);
+        assert!(app.copy_buffer_rows() > 0);
+        app.apply_replies(&[Reply::SelectClear]);
+        assert_eq!(app.dirty, Dirty::Full);
+        assert_eq!(app.file_rows(), app.screen.list_rows());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

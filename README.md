@@ -56,6 +56,14 @@ Press `?` inside vfm for the full key list. The essentials:
 | `;` | plugin menu |
 | `q`, `C-q`, `C-g` | close context, quit, quit and cd |
 
+Selected files appear in a copy/move buffer at the bottom of the file list.
+It shows up to five rows: with more selections, the first four filenames are
+followed by `n items more`. Items from other directories include their source
+directory. The buffer follows the file list's width as the preview divider
+moves, leaves the preview pane at full height, and hides when nothing is
+selected. Short terminals show fewer buffer rows so the file list stays usable.
+Use `p` to copy or `v` to move the selected items into the current directory.
+
 The focused preview has a highlighted divider and a `FOCUSED` header. Scrolling
 stops at the beginning or end of the loaded preview; large previews remain
 subject to the configured byte limit. `Enter` still opens the file.

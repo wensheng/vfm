@@ -513,24 +513,71 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_names_survive_ops_paths() {
-        let d = tmpdir("raw");
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let bad = std::ffi::OsStr::from_bytes(b"bad\xff name");
-            fs::write(d.join(bad), b"x").unwrap();
-            let dir = Dir::load(&d, TimeType::Modified, true).unwrap();
-            assert_eq!(dir.len(), 1);
-            let e = &dir.entries[0];
-            assert!(e.flags.has(EntryFlags::NON_UTF8));
-            // The lossy display string differs from the raw name...
-            assert!(e.name.contains('\u{FFFD}'));
-            // ...but path_at returns the true bytes.
-            let p = dir.path_at(0).unwrap();
-            assert_eq!(p.file_name().unwrap().as_bytes(), b"bad\xff name");
+        use std::os::unix::ffi::OsStrExt;
+
+        let d = tmpdir("raw-paths");
+        let mut dir = Dir::load(&d, TimeType::Modified, true).unwrap();
+        // Build readdir records in memory: macOS filesystems reject these names.
+        // Valid names around raw names also exercise raw_names index alignment.
+        let names = [
+            OsStr::new("before"),
+            OsStr::from_bytes(b"bad\xff name"),
+            OsStr::new("after"),
+            OsStr::from_bytes(b"bad\xfe name"),
+        ];
+        for name in names {
+            let flags = if name.to_str().is_none() {
+                EntryFlags::NON_UTF8
+            } else {
+                EntryFlags::default()
+            };
+            push_entry(
+                &mut dir.entries,
+                &mut dir.raw_names,
+                name,
+                Entry {
+                    name: name.to_string_lossy().into_owned().into_boxed_str(),
+                    size: 1,
+                    mtime: 0,
+                    mode: 0o644,
+                    flags,
+                },
+            );
         }
+        dir.matches = dir.len();
+        // Both raw names display identically, but operations must distinguish them.
+        assert_eq!(dir.entries[1].name, dir.entries[3].name);
+        assert!(dir.entries[1].name.contains('\u{FFFD}'));
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(dir.path_at(i).unwrap(), d.join(name));
+            dir.cursor = i;
+            assert_eq!(dir.hovered_path().unwrap(), d.join(name));
+        }
+        assert_eq!(dir.path_at(names.len()), None);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    // macOS filesystems require valid UTF-8; raw-name path handling is tested above.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn non_utf8_names_load_from_filesystem() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let d = tmpdir("raw");
+        let bad = OsStr::from_bytes(b"bad\xff name");
+        fs::write(d.join(bad), b"x").unwrap();
+        let dir = Dir::load(&d, TimeType::Modified, true).unwrap();
+        assert_eq!(dir.len(), 1);
+        let e = &dir.entries[0];
+        assert!(e.flags.has(EntryFlags::NON_UTF8));
+        // The lossy display string differs from the raw name...
+        assert!(e.name.contains('\u{FFFD}'));
+        // ...but path_at returns the true bytes.
+        let p = dir.path_at(0).unwrap();
+        assert_eq!(p.file_name().unwrap().as_bytes(), b"bad\xff name");
         let _ = fs::remove_dir_all(&d);
     }
 }
